@@ -2,7 +2,7 @@ import pandas as pd
 
 class TradingEnv:
 
-    def __init__(self, candles_file, tick_file):
+    def __init__(self, candles_file: str, tick_file: str):
         self.candles_file = candles_file
         self.tick_file = tick_file
         self.tick_line = 0
@@ -13,7 +13,7 @@ class TradingEnv:
         ask_value = 0
 
         # Get the name and identify if it is a BUY or SELL position
-        if position_name is "BUY":
+        if position_name == "BUY":
             ask_value = self.tick_file
         
         # Get the current tick's ask or bid price depending of position and save it to a variable
@@ -30,6 +30,6 @@ class TradingEnv:
 
 if __name__ == '__main__':
 
-    env = TradingEnv('EURUSD_Daily.csv')
-    df = pd.read_csv(env.candles_file)
+    env = TradingEnv('EURUSD_Daily.csv', 'EURUSD_ticks.csv')
+    df = pd.read_csv(env.tick_file, nrows=100)
     print(df)
