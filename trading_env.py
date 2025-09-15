@@ -1,12 +1,45 @@
 import pandas as pd
+from server import ZMQRepServer
 
 class TradingEnv:
 
-    def __init__(self, candles_file: str, tick_file: str):
+    def __init__(self, candles_file: str, tick_file: str, bind_address="tcp://*:5555"):
         self.candles_file = candles_file
         self.tick_file = tick_file
         self.current_tick = 0
         self.position_open = False
+        self.server = ZMQRepServer(bind_address, self.handle_request)
+        self.counter = 0
+
+    def start_server(self):
+        print("Starting Env Server...")
+        self.server.start()
+    
+    def stop_server(self):
+        print("Stoping Env Server...")
+        self.server.stop()
+
+    def handle_request(self, request):
+        """
+        Process incoming request and return a reply.
+        Request is expected to be a dict; adapt as needed.
+        """
+        self.counter += 1
+        # Simple example: support {"cmd": "ping"} and {"cmd": "sum", "values": [..]}
+        cmd = request.get("cmd") if isinstance(request, dict) else None
+
+        if cmd == "ping":
+            return {"reply": "pong", "count": self.counter}
+        elif cmd == "sum":
+            vals = request.get("values", [])
+            try:
+                s = sum(vals)
+                return {"reply": "ok", "sum": s}
+            except Exception as e:
+                return {"reply": "error", "error": str(e)}
+        else:
+            # default: echo
+            return {"reply": "unknown_command", "received": request}
 
     def get_tick(self):
         tick = None        
@@ -41,8 +74,3 @@ class TradingEnv:
         # If the tick current price equals to TP/SL then close the posistion
 
         # Calculate profit
-
-if __name__ == '__main__':
-
-    env = TradingEnv('EURUSD_Daily.csv', 'EURUSD_ticks.csv')
-    env.open_position("BUY", 50, 50)
