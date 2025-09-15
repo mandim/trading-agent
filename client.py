@@ -44,12 +44,6 @@ if __name__ == '__main__':
         print("Sending BUY...")
         print(client.request({"cmd": "BUY"}))
 
-        print("Sending sum...")
-        print(client.request({"cmd": "sum", "values": [1, 2, 3, 4]}))
-
-        print("Sending unknown...")
-        print(client.request({"cmd": "foo", "x": 123}))
-
     finally:
         client.close()
         env.stop_server()

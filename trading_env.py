@@ -9,8 +9,9 @@ class TradingEnv:
         self.current_tick = 0
         self.position_open = False
         self.server = ZMQRepServer(bind_address, self.handle_request)
-        self.counter = 0
         self.pip_value = pip_value
+        self.tp_pips = 50.0
+        self.sl_pips = 50.0
 
     def start_server(self):
         print("Starting Env Server...")
@@ -25,14 +26,13 @@ class TradingEnv:
         Process incoming request and return a reply.
         Request is expected to be a dict; adapt as needed.
         """
-        self.counter += 1
         # Simple example: support {"cmd": "ping"} and {"cmd": "sum", "values": [..]}
         cmd = request.get("cmd") if isinstance(request, dict) else None
 
         if cmd == "BUY":
-            self.open_position("BUY", 50, 100)
-            return {"reply": "BUY position opened", "count": self.counter}
-        elif cmd == "sum":
+            self.open_position("BUY", self.sl_pips, self.tp_pips)
+            return {"reply": "BUY position opened"}
+        elif cmd == "SELL":
             vals = request.get("values", [])
             try:
                 s = sum(vals)
@@ -70,6 +70,12 @@ class TradingEnv:
                 print(f"Ask price: {ask_value}")
                 self.current_tick+=1
             
+            # If tick_line goes to the end of file then close the position and stop the server (later return done/truncate for the episode end)
+            else:
+                print("Closing position...")
+                self.stop_server()
+                self.position_open = False
+            
             # Calculate the SL and TP by add or sub from the current price the SL/TP pips
             tp_value = ask_value + (tp_pips * self.pip_value)
             sl_value = ask_value - (sl_pips * self.pip_value)
@@ -78,9 +84,7 @@ class TradingEnv:
         
         
         
-        # Start comparing every tick_line each tick current price, increment the tick_line
-
-        # If tick_line goes to the end of file then close the position
+        # Start comparing every tick_line each tick current price, increment the tick_line        
         
         # If the tick current price equals to TP/SL then close the posistion
 
