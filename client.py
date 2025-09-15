@@ -32,7 +32,7 @@ class ZMQReqClient:
 
 if __name__ == '__main__':
 
-    env = TradingEnv('EURUSD_Daily.csv', 'EURUSD_ticks.csv', bind_address="tcp://127.0.0.1:5566")
+    env = TradingEnv(0.0001, 'EURUSD_Daily.csv', 'EURUSD_Ticks.csv', bind_address="tcp://127.0.0.1:5566")
     env.start_server()
 
     # Give some time to the server to bind
@@ -41,8 +41,8 @@ if __name__ == '__main__':
     client = ZMQReqClient("tcp://127.0.0.1:5566")
 
     try:
-        print("Sending ping...")
-        print(client.request({"cmd": "ping"}))
+        print("Sending BUY...")
+        print(client.request({"cmd": "BUY"}))
 
         print("Sending sum...")
         print(client.request({"cmd": "sum", "values": [1, 2, 3, 4]}))
