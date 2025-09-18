@@ -6,7 +6,7 @@ from trading_env import TradingEnv
 class ZMQReqClient:
     """Tiny REQ client for testing the server."""
 
-    def __init__(self, connect_addr: str, context: Optional[zmq.Context] = None, timeout_ms: int = 3000):
+    def __init__(self, connect_addr: str, context: Optional[zmq.Context] = None, timeout_ms: int = None):
         self.connect_addr = connect_addr
         self.context = context or zmq.Context()
         self.timeout_ms = timeout_ms
@@ -41,8 +41,11 @@ if __name__ == '__main__':
     client = ZMQReqClient("tcp://127.0.0.1:5566")
 
     try:
-        print("Sending BUY...")
-        print(client.request({"cmd": "BUY"}))
+        for index in range(15):
+            print(f"Opening position {index}")
+            print(client.request({"cmd": "BUY"}))
+            print(f"Opening position {index}")
+            print(client.request({"cmd": "SELL"}))
 
     finally:
         client.close()

@@ -18,7 +18,8 @@ class ZMQRepServer:
         bind_addr: str,
         handler: Optional[Callable[[Any], Any]] = None,
         context: Optional[zmq.Context] = None,
-        poll_timeout_ms: int = 500,
+        # poll_timeout_ms: int = 500,
+        poll_timeout_ms = None
     ):
         """
         :param bind_addr: e.g. "tcp://*:5555"
