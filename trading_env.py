@@ -1,5 +1,6 @@
 import pandas as pd
 from server import ZMQRepServer
+import talib as ta
 
 class TradingEnv:
 
@@ -172,9 +173,9 @@ class TradingEnv:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Ask price: {ask_price} <= SL {sl_value} -> closing position (loss).")
                     self.position_open = False
                     break
-                # else:
+                else:
                     # still open — continue scanning (don't set position_open False here)
-                    # print(f"Row {idx}, {ts}: Ask {ask_price} between SL and TP -> position still open.")
+                    print(f"Row {idx}, {ts}: Ask {ask_price} between SL and TP -> position still open.")
                     # continue loop until TP or SL or EOF
 
             if self.position_open:
@@ -183,4 +184,4 @@ class TradingEnv:
                 self.position_open = False
                 self.stop_server()
 
-        # TODO: compute profit/loss if needed and return details
+        # TODO: calculate the next state and reward

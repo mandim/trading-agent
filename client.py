@@ -41,7 +41,7 @@ if __name__ == '__main__':
     client = ZMQReqClient("tcp://127.0.0.1:5566")
 
     try:
-        for index in range(15):
+        for index in range(5):
             print(f"Opening position {index}")
             print(client.request({"cmd": "BUY"}))
             print(f"Opening position {index}")
