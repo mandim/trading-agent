@@ -1,18 +1,21 @@
 import pandas as pd
 from server import ZMQRepServer
 import talib as ta
+import math
 
 class TradingEnv:
 
-    def __init__(self, pip_value: float, candles_file: str, tick_file: str, bind_address="tcp://*:5555"):
+    def __init__(self, pip_decimal: float, candles_file: str, tick_file: str, bind_address="tcp://*:5555"):
         self.candles_file = candles_file
         self.tick_file = tick_file
         self.current_tick_row = 0
         self.position_open = False
         self.server = ZMQRepServer(bind_address, self.handle_request)
-        self.pip_value = pip_value
+        self.pip_decimal = pip_decimal
         self.tp_pips = 50.0
         self.sl_pips = 50.0
+        self.lot = 1.0
+        self.balance = 100000
 
     def start_server(self):
         print("Starting Env Server...")
@@ -101,8 +104,8 @@ class TradingEnv:
             self.current_tick_row = idx + 1
 
             # compute SL/TP absolute prices
-            tp_value = bid_value - (tp_pips * self.pip_value)
-            sl_value = bid_value + (sl_pips * self.pip_value)
+            tp_value = bid_value - (tp_pips * self.pip_decimal)
+            sl_value = bid_value + (sl_pips * self.pip_decimal)
             # print(f"TP value: {tp_value}")
             # print(f"SL value: {sl_value}")
 
@@ -117,6 +120,8 @@ class TradingEnv:
                 if bid_price <= tp_value:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Bid price: {bid_price} <= TP {tp_value} -> closing position (profit).")
                     self.position_open = False
+                    # Calculate new balance
+                    self.balance = self.calculate_reward(self, True)
                     break
                 elif bid_price > sl_value:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Bid price: {bid_price} > SL {sl_value} -> closing position (loss).")
@@ -152,8 +157,8 @@ class TradingEnv:
             self.current_tick_row = idx + 1
 
             # compute SL/TP absolute prices
-            tp_value = ask_value + (tp_pips * self.pip_value)
-            sl_value = ask_value - (sl_pips * self.pip_value)
+            tp_value = ask_value + (tp_pips * self.pip_decimal)
+            sl_value = ask_value - (sl_pips * self.pip_decimal)
             # print(f"TP value: {tp_value}")
             # print(f"SL value: {sl_value}")
 
@@ -185,3 +190,22 @@ class TradingEnv:
                 self.stop_server()
 
         # TODO: calculate the next state and reward
+
+    def calculate_reward(self, isProfitable: bool = None):
+        
+        old_balance = self.balance
+        exchange_rate = 1 # Suppose that the quote currency is the same as the account currency
+        pip_value = ((self.lot * 100000) * self.pip_decimal) / exchange_rate
+        profit = 0
+        
+        if isProfitable:
+            profit = pip_value * self.tp_pips
+        elif isProfitable == False:
+            profit = -pip_value * self.sl_pips
+        
+        next_balance = old_balance + profit
+        self.balance = next_balance
+
+        reward = math.log(next_balance / old_balance)
+
+        return reward
