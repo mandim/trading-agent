@@ -15,7 +15,8 @@ class TradingEnv:
         self.tp_pips = 50.0
         self.sl_pips = 50.0
         self.lot = 1.0
-        self.balance = 100000
+        self.balance = 100000.0
+        self.truncated = False
 
     def start_server(self):
         print("Starting Env Server...")
@@ -120,12 +121,16 @@ class TradingEnv:
                 if bid_price <= tp_value:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Bid price: {bid_price} <= TP {tp_value} -> closing position (profit).")
                     self.position_open = False
-                    # Calculate new balance
-                    self.balance = self.calculate_reward(self, True)
+                    # Calculate new reward as profit
+                    reward = self.calculate_reward(True)
+                    print(f"Reward: {reward}")
                     break
                 elif bid_price > sl_value:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Bid price: {bid_price} > SL {sl_value} -> closing position (loss).")
                     self.position_open = False
+                    # Calculate new reward as loss
+                    reward = self.calculate_reward(False)
+                    print(f"Reward: {reward}")
                     break
                 # else:
                     # still open — continue scanning (don't set position_open False here)
@@ -173,14 +178,20 @@ class TradingEnv:
                 if ask_price >= tp_value:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Ask price: {ask_price} >= TP {tp_value} -> closing position (profit).")
                     self.position_open = False
+                    # Calculate new reward
+                    reward = self.calculate_reward(True)
+                    print(f"Reward: {reward}")
                     break
                 elif ask_price <= sl_value:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Ask price: {ask_price} <= SL {sl_value} -> closing position (loss).")
                     self.position_open = False
+                    # Calculate new reward as profit
+                    reward = self.calculate_reward(False)
+                    print(f"Reward: {reward}")
                     break
-                else:
+                # else:
                     # still open — continue scanning (don't set position_open False here)
-                    print(f"Row {idx}, {ts}: Ask {ask_price} between SL and TP -> position still open.")
+                    # print(f"Row {idx}, {ts}: Ask {ask_price} between SL and TP -> position still open.")
                     # continue loop until TP or SL or EOF
 
             if self.position_open:
@@ -191,7 +202,7 @@ class TradingEnv:
 
         # TODO: calculate the next state and reward
 
-    def calculate_reward(self, isProfitable: bool = None):
+    def calculate_reward(self, isProfitable: bool):
         
         old_balance = self.balance
         exchange_rate = 1 # Suppose that the quote currency is the same as the account currency
@@ -204,8 +215,15 @@ class TradingEnv:
             profit = -pip_value * self.sl_pips
         
         next_balance = old_balance + profit
-        self.balance = next_balance
+        
+        print(f"Previous balance: {old_balance}, Pip value: {pip_value}, Profit: {profit}, New Balance: {next_balance}")
+        if (next_balance > 0):
+            reward = math.log(next_balance / old_balance)
+            self.balance = next_balance
+        else:
+            reward = 0
+            # If new balance is under 0 set the account balance to zero and end the episode
+            self.truncated = True
+            self.balance = 0
 
-        reward = math.log(next_balance / old_balance)
-
-        return reward
+        return 0 if reward <= 0.0 else 1
