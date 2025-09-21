@@ -17,6 +17,7 @@ class TradingEnv:
         self.lot = 1.0
         self.balance = 100000.0
         self.truncated = False
+        self.done = False
 
     def start_server(self):
         print("Starting Env Server...")
@@ -35,10 +36,10 @@ class TradingEnv:
         cmd = request.get("cmd") if isinstance(request, dict) else None
 
         if cmd == "BUY":
-            self.open_position("BUY", self.sl_pips, self.tp_pips)
+            self.step("BUY")
             return {"reply": "BUY position closed and return current state to the Agent"}
         elif cmd == "SELL":
-            self.open_position("SELL", self.sl_pips, self.tp_pips)
+            self.step("SELL")
             return {"reply": "SELL position closed and return current state to the Agent"}
         elif cmd == "HOLD":
             return {"reply": "Hold position and continue"}
@@ -76,23 +77,37 @@ class TradingEnv:
             # the first yielded row will be the one at current_tick_row (if exists)
             return idx, row
         return None, None
-
-    def open_position(self, position_name: str, sl_pips: float, tp_pips: float):
+    
+    def reset(self):
+        self.balance = 100000
+        self.current_tick_row = 0
+        self.position_open = False
+        self.truncated = False
+        self.done = False
+    
+    def step(self, action: str):
+        """
+        This is the step function that opens a new position. The action is the position of BUY, SHORT or HOLD.
+        The step returns a new state of OHLCV as a new observation along with a reward that is based on the 
+        positive or negative profit.
+        """
         ask_value = 0.0
         bid_value = 0.0
         sl_value = 0.0
         tp_value = 0.0
+        is_profitable: bool = None
 
         # open position flag
         self.position_open = True
 
         # Check if the position is Short
-        if position_name == "SELL":
+        if action == "SELL":
             idx, tick_row = self.get_tick_row()
             if idx is None:
                 # EOF at the very beginning
                 print("No more ticks available — closing and stopping server.")
                 self.position_open = False
+                self.done = True
                 self.stop_server()
                 return
 
@@ -105,10 +120,8 @@ class TradingEnv:
             self.current_tick_row = idx + 1
 
             # compute SL/TP absolute prices
-            tp_value = bid_value - (tp_pips * self.pip_decimal)
-            sl_value = bid_value + (sl_pips * self.pip_decimal)
-            # print(f"TP value: {tp_value}")
-            # print(f"SL value: {sl_value}")
+            tp_value = bid_value - (self.tp_pips * self.pip_decimal)
+            sl_value = bid_value + (self.sl_pips * self.pip_decimal)
 
             # iterate subsequent ticks using absolute indexing
             for idx, row in self.iter_ticks_from(start_row=self.current_tick_row, chunksize=1000):
@@ -121,16 +134,12 @@ class TradingEnv:
                 if bid_price <= tp_value:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Bid price: {bid_price} <= TP {tp_value} -> closing position (profit).")
                     self.position_open = False
-                    # Calculate new reward as profit
-                    reward = self.calculate_reward(True)
-                    print(f"Reward: {reward}")
+                    is_profitable = True
                     break
                 elif bid_price > sl_value:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Bid price: {bid_price} > SL {sl_value} -> closing position (loss).")
                     self.position_open = False
-                    # Calculate new reward as loss
-                    reward = self.calculate_reward(False)
-                    print(f"Reward: {reward}")
+                    is_profitable = False
                     break
                 # else:
                     # still open — continue scanning (don't set position_open False here)
@@ -141,15 +150,17 @@ class TradingEnv:
                 # EOF reached without hitting TP or SL
                 print("Reached end of tick file before TP/SL. Closing position and stopping server.")
                 self.position_open = False
+                self.done = True
                 self.stop_server()
 
         # Check if the position is Long
-        if position_name == "BUY":
+        if action == "BUY":
             idx, tick_row = self.get_tick_row()
             if idx is None:
                 # EOF at the very beginning
                 print("No more ticks available — closing and stopping server.")
                 self.position_open = False
+                self.done = True
                 self.stop_server()
                 return
 
@@ -162,10 +173,8 @@ class TradingEnv:
             self.current_tick_row = idx + 1
 
             # compute SL/TP absolute prices
-            tp_value = ask_value + (tp_pips * self.pip_decimal)
-            sl_value = ask_value - (sl_pips * self.pip_decimal)
-            # print(f"TP value: {tp_value}")
-            # print(f"SL value: {sl_value}")
+            tp_value = ask_value + (self.tp_pips * self.pip_decimal)
+            sl_value = ask_value - (self.sl_pips * self.pip_decimal)
 
             # iterate subsequent ticks using absolute indexing
             for idx, row in self.iter_ticks_from(start_row=self.current_tick_row, chunksize=1000):
@@ -178,16 +187,12 @@ class TradingEnv:
                 if ask_price >= tp_value:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Ask price: {ask_price} >= TP {tp_value} -> closing position (profit).")
                     self.position_open = False
-                    # Calculate new reward
-                    reward = self.calculate_reward(True)
-                    print(f"Reward: {reward}")
+                    is_profitable = True
                     break
                 elif ask_price <= sl_value:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Ask price: {ask_price} <= SL {sl_value} -> closing position (loss).")
                     self.position_open = False
-                    # Calculate new reward as profit
-                    reward = self.calculate_reward(False)
-                    print(f"Reward: {reward}")
+                    is_profitable = False
                     break
                 # else:
                     # still open — continue scanning (don't set position_open False here)
@@ -198,9 +203,12 @@ class TradingEnv:
                 # EOF reached without hitting TP or SL
                 print("Reached end of tick file before TP/SL. Closing position and stopping server.")
                 self.position_open = False
+                self.done = True
                 self.stop_server()
 
         # TODO: calculate the next state and reward
+        reward = self.calculate_reward(isProfitable=is_profitable)
+        print(f"Reward: {reward}")
 
     def calculate_reward(self, isProfitable: bool):
         

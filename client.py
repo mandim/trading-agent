@@ -42,9 +42,9 @@ if __name__ == '__main__':
 
     try:
         for index in range(5):
-            print(f"Opening position {index}")
+            print(f"Opening long position")
             print(client.request({"cmd": "BUY"}))
-            print(f"Opening position {index}")
+            print(f"Opening short position")
             print(client.request({"cmd": "SELL"}))
 
     finally:
