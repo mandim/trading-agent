@@ -18,6 +18,13 @@ class TradingEnv:
         self.balance = 100000.0
         self.truncated = False
         self.done = False
+        self.risk_per_trade_usd = 1000.0   # denominator for PnL normalization (e.g., ~1% of 100k)
+        self.dd_penalty_lambda = 1.0       # how strongly to punish new drawdown (tune 0.3–2.0)
+        self.max_dd_stop = 0.30            # hard stop at 30% drawdown (optional)
+        # RUNTIME (also set these in reset)
+        self.equity = self.balance
+        self.equity_peak = self.balance
+        self.max_drawdown = 0.0
 
     def start_server(self):
         print("Starting Env Server...")
@@ -84,6 +91,13 @@ class TradingEnv:
         self.position_open = False
         self.truncated = False
         self.done = False
+        self.equity = self.balance
+        self.equity_peak = self.balance
+        self.max_drawdown = 0.0
+
+        # Build initial observation (first tick or first bar/indicators)
+        obs = self._get_observation(self.current_tick_row)
+        return obs, {}
     
     def step(self, action: str):
         """
@@ -108,7 +122,6 @@ class TradingEnv:
                 print("No more ticks available — closing and stopping server.")
                 self.position_open = False
                 self.done = True
-                self.stop_server()
                 return
 
             # read current ask and advance the pointer to next absolute row
@@ -136,7 +149,7 @@ class TradingEnv:
                     self.position_open = False
                     is_profitable = True
                     break
-                elif bid_price > sl_value:
+                elif bid_price >= sl_value:
                     print(f"E row idx: {idx}, Timestamp: {ts}, Bid price: {bid_price} > SL {sl_value} -> closing position (loss).")
                     self.position_open = False
                     is_profitable = False
@@ -151,7 +164,6 @@ class TradingEnv:
                 print("Reached end of tick file before TP/SL. Closing position and stopping server.")
                 self.position_open = False
                 self.done = True
-                self.stop_server()
 
         # Check if the position is Long
         if action == "BUY":
@@ -161,7 +173,6 @@ class TradingEnv:
                 print("No more ticks available — closing and stopping server.")
                 self.position_open = False
                 self.done = True
-                self.stop_server()
                 return
 
             # read current ask and advance the pointer to next absolute row
@@ -204,34 +215,76 @@ class TradingEnv:
                 print("Reached end of tick file before TP/SL. Closing position and stopping server.")
                 self.position_open = False
                 self.done = True
-                self.stop_server()
 
-        # TODO: calculate the next state and reward
-        reward = self.calculate_reward(isProfitable=is_profitable)
-        print(f"Reward: {reward}")
+        reward = self._calculate_reward(isProfitable=is_profitable)
+        obs = self._get_observation(self.current_tick_row)
+        info = {
+            "position": "BUY" if action == "BUY" else "SELL",
+            "tp": tp_value,
+            "sl": sl_value,
+            "final_idx": self.current_tick_row,
+            "balance": self.balance,
+            "equity": self.equity,
+            "equity_peak": self.equity_peak,
+            "max_drawdown": self.max_drawdown,
+            "last_reward": reward
+        }
+        return obs, reward, self.done, self.truncated, info
 
-    def calculate_reward(self, isProfitable: bool):
-        
+    def _get_observation(self, idx):
+        # read tick row
+        for i, row in self.iter_ticks_from(start_row=idx, chunksize=1000):
+            # only first row
+            ask = float(row["Ask price"])
+            bid = float(row["Bid price"])
+            spread = ask - bid
+            # later you can add indicators from your candles file
+            obs = [ask, bid, spread, float(self.position_open)]
+            return obs
+        return [0.0, 0.0, 0.0, 0.0]
+
+    def _calculate_reward(self, isProfitable: bool):
+        # --- 1) Compute trade PnL ---
         old_balance = self.balance
-        exchange_rate = 1 # Suppose that the quote currency is the same as the account currency
+        exchange_rate = 1.0  # adjust if needed
         pip_value = ((self.lot * 100000) * self.pip_decimal) / exchange_rate
-        profit = 0
-        
-        if isProfitable:
+        profit = 0.0
+        if isProfitable is True:
             profit = pip_value * self.tp_pips
-        elif isProfitable == False:
+        elif isProfitable is False:
             profit = -pip_value * self.sl_pips
-        
-        next_balance = old_balance + profit
-        
-        print(f"Previous balance: {old_balance}, Pip value: {pip_value}, Profit: {profit}, New Balance: {next_balance}")
-        if (next_balance > 0):
-            reward = math.log(next_balance / old_balance)
-            self.balance = next_balance
-        else:
-            reward = 0
-            # If new balance is under 0 set the account balance to zero and end the episode
-            self.truncated = True
-            self.balance = 0
 
-        return 0 if reward <= 0.0 else 1
+        # --- 2) Update balance & equity ---
+        next_balance = old_balance + profit
+        if next_balance <= 0:
+            self.truncated = True
+            self.done = True
+            self.balance = 0.0
+        else:
+            self.balance = next_balance
+
+        old_equity = self.equity
+        self.equity = self.balance  # equity = balance here (no floating PnL)
+
+        # --- 3) Update drawdown metrics ---
+        if self.equity > self.equity_peak:
+            self.equity_peak = self.equity
+        dd_now = 0.0 if self.equity_peak == 0 else (self.equity_peak - self.equity) / self.equity_peak
+        dd_now = max(0.0, dd_now)
+        new_dd_increment = max(0.0, dd_now - self.max_drawdown)
+        if dd_now > self.max_drawdown:
+            self.max_drawdown = dd_now
+
+        # --- 4) Normalize profit and apply DD penalty ---
+        denom = max(1e-8, self.risk_per_trade_usd)
+        pnl_norm = profit / denom
+        penalty = self.dd_penalty_lambda * new_dd_increment
+        reward = pnl_norm - penalty
+
+        # --- 5) Hard stop if max DD breached ---
+        if self.max_drawdown >= self.max_dd_stop:
+            self.done = True
+            self.truncated = True
+
+        return float(reward)
+
