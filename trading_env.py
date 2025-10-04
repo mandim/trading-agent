@@ -1,11 +1,11 @@
 import pandas as pd
 from server import ZMQRepServer
-import talib as ta
 import numpy as np
+import os
 
 class TradingEnv:
 
-    def __init__(self, pip_decimal: float, candles_file: str, tick_file: str, bind_address="tcp://*:5555"):
+    def __init__(self, pip_decimal: float, candles_file: str, tick_file: str, bind_address="tcp://*:5555", cache_dir: str = "cache_fx_EURUSD_D1"):
         self.candles_file = candles_file
         self.tick_file = tick_file
         self.current_tick_row = 0
@@ -30,10 +30,11 @@ class TradingEnv:
         # ---- BAR/TICK FUSION CONFIG ----
         self.window_len = 32  # number of bars to include in the observation window
 
-        # Load bars + indicators and build tick->bar alignment
-        self._load_candles_and_indicators()
-        self._compute_warmup()
-        self._prepare_tick_bar_alignment()
+        self.cache_dir = cache_dir
+        self._load_cache(self.cache_dir)
+
+        # Kept-tick cursor (0..n_ticks-1). We’ll set a proper start in reset()
+        self.t = 0
 
     def start_server(self):
         print("Starting Env Server...")
@@ -62,43 +63,29 @@ class TradingEnv:
         else:
             # default: echo
             return {"reply": "unknown_command", "received": request}
+    
+    def _load_cache(self, cache_dir: str):
+        needed = ["bars_features.npy", "bar_times.npy", "tick_ask.npy", "tick_bid.npy", "tick_to_bar.npy"]
+        for f in needed:
+            p = os.path.join(cache_dir, f)
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"Missing cache artifact: {p}")
 
-    # --- helper generator that yields rows with a global index ---
-    def _iter_ticks_from(self, start_row=0, chunksize=1000):
-        """
-        Iterate rows from `start_row` (absolute row index in file).
-        Yields (global_idx, row) pairs where global_idx is the absolute row index.
-        """
-        global_start = 0
-        for chunk in pd.read_csv(self.tick_file, chunksize=chunksize):
-            chunk_len = len(chunk)
-            chunk_end = global_start + chunk_len
-            # if entire chunk is before start_row, skip it quickly
-            if chunk_end <= start_row:
-                global_start = chunk_end
-                continue
-            # iterate rows in chunk and compute absolute index
-            for i, (_, row) in enumerate(chunk.iterrows()):
-                global_idx = global_start + i
-                if global_idx < start_row:
-                    continue
-                yield global_idx, row
-            global_start = chunk_end
+        self.bar_features = np.load(os.path.join(cache_dir, "bars_features.npy"), mmap_mode="r")   # (n_bars, n_feats) float32
+        self.bar_times    = np.load(os.path.join(cache_dir, "bar_times.npy"),    mmap_mode="r")    # (n_bars,) int64
+        self.tick_ask     = np.load(os.path.join(cache_dir, "tick_ask.npy"),     mmap_mode="r")    # (n_ticks,) float32
+        self.tick_bid     = np.load(os.path.join(cache_dir, "tick_bid.npy"),     mmap_mode="r")    # (n_ticks,) float32
+        self.tick_to_bar  = np.load(os.path.join(cache_dir, "tick_to_bar.npy"),  mmap_mode="r")    # (n_ticks,) int32
 
-    def _get_tick_row(self):
-        """
-        Return (idx, row) for the current_tick_row or (None, None) if EOF.
-        """
-        for idx, row in self._iter_ticks_from(start_row=self.current_tick_row, chunksize=1000):
-            # the first yielded row will be the one at current_tick_row (if exists)
-            return idx, row
-        return None, None
+        self.n_bars  = int(self.bar_features.shape[0])
+        self.n_feats = int(self.bar_features.shape[1])
+        self.n_ticks = int(self.tick_ask.shape[0])
+
+        assert self.tick_bid.shape == self.tick_ask.shape
+        assert self.tick_to_bar.shape[0] == self.n_ticks
     
     def reset(self):
         self.balance = 100000.0
-        if len(self.abs_tick_indices) == 0:
-            raise ValueError("No valid ticks after warmup. Check data/time parsing and warmup settings.")
-        self.current_tick_row = int(self.abs_tick_indices[0])  # start at first valid aligned tick
         self.position_open = False
         self.truncated = False
         self.done = False
@@ -106,140 +93,120 @@ class TradingEnv:
         self.equity_peak = self.balance
         self.max_drawdown = 0.0
 
-        # Build initial observation (first tick or first bar/indicators)
-        obs = self._get_observation(self.current_tick_row)
+        # warm start: first tick whose bar index has >= window_len bars behind it
+        min_bar = self.window_len - 1
+        # tick_to_bar is non-decreasing; find first tick mapping to bar >= min_bar
+        self.t = int(np.searchsorted(self.tick_to_bar, min_bar, side="left"))
+        if self.t >= self.n_ticks:
+            raise ValueError("No valid ticks after warmup. Check data/time parsing and warmup settings.")
+
+        # maintain current_tick_row for backward compatibility (just mirror kept tick index)
+        self.current_tick_row = self.t
+
+        obs = self._get_observation(self.t)
         return obs, {}
     
     def step(self, action: str):
-        """
-        Event-driven per-trade step.
-        Actions: "BUY", "SELL", "HOLD"
-        Returns: obs, reward, terminated, truncated, info  (Gymnasium-compatible)
-        """
         if self.done:
-            # Safe terminal repeat
-            obs = self._get_observation(self.current_tick_row)
+            obs = self._get_observation(self.t)
             return obs, 0.0, True, self.truncated, {"note": "episode already done"}
 
-        # Defaults
+        # guard: end of data
+        if self.t >= self.n_ticks - 1:
+            self.done = True
+            obs = self._get_observation(self.t)
+            return obs, 0.0, True, self.truncated, {"reason": "eof"}
+
         tp_value = sl_value = None
         is_profitable = None
 
-        # HOLD: advance one tick, no trade opened
         if action == "HOLD":
-            # Move pointer by 1 if possible
-            idx, row = self._get_tick_row()
-            if idx is None:
-                self.done = True
-                obs = self._get_observation(self.current_tick_row)
-                return obs, 0.0, True, self.truncated, {"action": "HOLD", "reason": "eof"}
-            # advance pointer to next row and return 0 reward
-            self.current_tick_row = idx + 1
-            obs = self._get_observation(self.current_tick_row)
+            self.t += 1
+            self.current_tick_row = self.t
+            obs = self._get_observation(self.t)
             return obs, 0.0, False, self.truncated, {"action": "HOLD"}
 
-        # Open position
-        self.position_open = True
+        # entry prices at current tick
+        entry_ask = float(self.tick_ask[self.t])
+        entry_bid = float(self.tick_bid[self.t])
 
-        # ---------- SELL (short) ----------
-        if action == "SELL":
-            idx, tick_row = self._get_tick_row()
-            if idx is None:
-                self.position_open = False
-                self.done = True
-                obs = self._get_observation(self.current_tick_row)
-                return obs, 0.0, True, self.truncated, {"action": "SELL", "reason": "eof_before_entry"}
+        if action == "BUY":
+            entry = entry_ask
+            tp_value = entry + self.tp_pips * self.pip_decimal
+            sl_value = entry - self.sl_pips * self.pip_decimal
 
-            bid_value = float(tick_row["Bid price"])
-            # advance pointer past entry tick
-            self.current_tick_row = idx + 1
-
-            # exit thresholds (exit at ask when covering a short, but we check levels on bid
-            # to avoid lookahead since fills happen on ask side but barrier decision uses best available)
-            tp_value = bid_value - (self.tp_pips * self.pip_decimal)
-            sl_value = bid_value + (self.sl_pips * self.pip_decimal)
-
-            for idx, row in self._iter_ticks_from(start_row=self.current_tick_row, chunksize=1000):
-                bid_price = float(row["Bid price"])
-                # move pointer forward
-                self.current_tick_row = idx + 1
-
-                if bid_price <= tp_value:
-                    self.position_open = False
+            k = self.t
+            # long exits at BID
+            while k + 1 < self.n_ticks:
+                k += 1
+                px = float(self.tick_bid[k])
+                if px >= tp_value:
                     is_profitable = True
                     break
-                elif bid_price >= sl_value:  # exact-touch counts (fixed)
-                    self.position_open = False
+                if px <= sl_value:
                     is_profitable = False
                     break
+            self.t = k
 
-            if self.position_open:
-                # EOF without TP/SL
-                self.position_open = False
-                self.done = True
-                # fall through to reward calc (treat as flat PnL from threshold distance if you want;
-                # here we just compute via your _calculate_reward using TP/SL choice below)
-                # choose a conservative close: treat as SL
-                is_profitable = False
+            # optional: subtract entry spread once
+            pnl_pips = (float(self.tick_bid[self.t]) - entry) / self.pip_decimal
+            pnl_pips -= (entry_ask - entry_bid) / self.pip_decimal
 
-        # ---------- BUY (long) ----------
-        elif action == "BUY":
-            idx, tick_row = self._get_tick_row()
-            if idx is None:
-                self.position_open = False
-                self.done = True
-                obs = self._get_observation(self.current_tick_row)
-                return obs, 0.0, True, self.truncated, {"action": "BUY", "reason": "eof_before_entry"}
+        elif action == "SELL":
+            entry = entry_bid
+            tp_value = entry - self.tp_pips * self.pip_decimal
+            sl_value = entry + self.sl_pips * self.pip_decimal
 
-            ask_value = float(tick_row["Ask price"])
-            # advance pointer past entry tick
-            self.current_tick_row = idx + 1
-
-            tp_value = ask_value + (self.tp_pips * self.pip_decimal)
-            sl_value = ask_value - (self.sl_pips * self.pip_decimal)
-
-            for idx, row in self._iter_ticks_from(start_row=self.current_tick_row, chunksize=1000):
-                ask_price = float(row["Ask price"])
-                # move pointer forward
-                self.current_tick_row = idx + 1
-
-                if ask_price >= tp_value:
-                    self.position_open = False
+            k = self.t
+            # short exits at ASK
+            while k + 1 < self.n_ticks:
+                k += 1
+                px = float(self.tick_ask[k])
+                if px <= tp_value:
                     is_profitable = True
                     break
-                elif ask_price <= sl_value:
-                    self.position_open = False
+                if px >= sl_value:
                     is_profitable = False
                     break
+            self.t = k
 
-            if self.position_open:
-                # EOF without TP/SL
-                self.position_open = False
-                self.done = True
-                # conservative close: treat as SL
-                is_profitable = False
+            # optional: subtract entry spread once
+            pnl_pips = (entry - float(self.tick_ask[self.t])) / self.pip_decimal
+            pnl_pips -= (entry_ask - entry_bid) / self.pip_decimal
 
         else:
-            # Unknown action: no-op advance 1 tick
-            idx, row = self._get_tick_row()
-            if idx is None:
-                self.done = True
-                obs = self._get_observation(self.current_tick_row)
-                return obs, 0.0, True, self.truncated, {"action": action, "reason": "eof"}
-            self.current_tick_row = idx + 1
-            obs = self._get_observation(self.current_tick_row)
+            # Unknown action: treat as HOLD
+            self.t += 1
+            self.current_tick_row = self.t
+            obs = self._get_observation(self.t)
             return obs, 0.0, False, self.truncated, {"action": action, "note": "unknown_action_noop"}
 
-        # ----- Compute reward (DD-aware) -----
-        reward = self._calculate_reward(isProfitable=is_profitable)
+        # EOF without TP/SL? treat as SL (your previous policy)
+        if is_profitable is None:
+            is_profitable = False
+            if self.t >= self.n_ticks - 1:
+                self.done = True
 
-        # ----- Build obs & info -----
-        obs = self._get_observation(self.current_tick_row)
+        # reward & equity updates (reuse your existing logic)
+        reward = self._calculate_reward(isProfitable=is_profitable)
+        # If you prefer reward from pnl, use pnl_pips above.
+        # equity updates if you keep them:
+        # self.equity += self._usd_from_pips(pnl_pips)
+
+        self.equity_peak = max(self.equity_peak, self.equity)
+        dd = 1.0 - (self.equity / (self.equity_peak + 1e-9))
+        self.max_drawdown = max(self.max_drawdown, dd)
+        if dd >= self.max_dd_stop:
+            self.done = True
+            self.truncated = True
+
+        self.current_tick_row = self.t
+        obs = self._get_observation(self.t)
         info = {
             "action": action,
             "tp": tp_value,
             "sl": sl_value,
-            "final_idx": self.current_tick_row,
+            "final_idx": self.t,
             "balance": self.balance,
             "equity": self.equity,
             "equity_peak": self.equity_peak,
@@ -247,60 +214,34 @@ class TradingEnv:
             "is_profitable": is_profitable,
             "last_reward": reward,
         }
-
         return obs, float(reward), self.done, self.truncated, info
 
-    def _get_observation(self, idx):
+    def _get_observation(self, tick_idx: int):
         """
-        Build observation at absolute tick row 'idx':
+        Build observation at kept tick index 'tick_idx':
         - live tick features: ask, bid, spread
-        - window_len bars of indicators up to the most recent CLOSED bar
+        - window_len bars of precomputed indicators up to the most recent CLOSED bar
         """
-        # Find nearest kept tick position <= idx (no lookahead)
-        pos = np.searchsorted(self.abs_tick_indices, idx, side="right") - 1
-        if pos < 0:
-            pos = 0
-        if pos >= len(self.abs_tick_indices):
-            # Past the last aligned tick: return zeros
-            ask = bid = spread = 0.0
-            bar_idx = len(self.bars) - 1
-        else:
-            abs_tick_idx = int(self.abs_tick_indices[pos])
-
-            # Read that tick’s prices via your generator (first row from abs_tick_idx)
-            ask = bid = None
-            for t_idx, row in self._iter_ticks_from(start_row=abs_tick_idx, chunksize=1000):
-                ask = float(row["Ask price"])
-                bid = float(row["Bid price"])
-                break
-            if ask is None or bid is None:
-                ask = bid = 0.0
-            spread = ask - bid
-
-            bar_idx = int(self.bar_idx_for_tick[pos])
-
-        # Slice bar window [bar_idx - L + 1, bar_idx]
+        bar_idx = int(self.tick_to_bar[tick_idx])
         L = self.window_len
-        start = max(0, bar_idx - L + 1)
-        w = self.bars.iloc[start:bar_idx+1]
+        start = bar_idx - L + 1
 
-        def pad(series):
-            a = series.values.astype(np.float32)
-            if len(a) < L:
-                a = np.hstack([np.zeros(L - len(a), dtype=np.float32), a])
-            return a
+        if start < 0:
+            pad = np.zeros((-start, self.n_feats), dtype=np.float32)
+            win = np.asarray(self.bar_features[0:bar_idx+1], dtype=np.float32)
+            feat_win = np.vstack([pad, win])
+        else:
+            feat_win = np.asarray(self.bar_features[start:bar_idx+1], dtype=np.float32)
+
+        ask = float(self.tick_ask[tick_idx])
+        bid = float(self.tick_bid[tick_idx])
+        spread = ask - bid
 
         obs = np.hstack([
-            pad(w["ret1"]),
-            pad(w["sma50"]),
-            pad(w["ema12"]),
-            pad(w["ema26"]),
-            pad(w["macd"]),
-            pad(w["macd_sig"]),
-            pad(w["rsi14"]),
-            pad(w["atr14"]),
+            feat_win.ravel(),
             np.array([ask, bid, spread, float(self.position_open)], dtype=np.float32),
         ])
+        # safety
         obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
         return obs
 
@@ -348,107 +289,3 @@ class TradingEnv:
             self.truncated = True
 
         return float(reward)
-
-    def _ensure_datetime(self, ds, ts):
-        """
-        Bars have separate Date (YYYYMMDD or YYYY-MM-DD) and Timestamp (HH:MM:SS).
-        Returns a pandas datetime series.
-        """
-        ds = pd.to_datetime(ds.astype(str), format="%Y%m%d", errors="coerce", utc=False)
-        # If your Date is already like '2020-09-15', the above will be NaT; try auto-parse:
-        if ds.isna().any():
-            ds = pd.to_datetime(ds, errors="coerce", utc=False)
-        # combine date + time
-        ts = pd.to_datetime(ts.astype(str), format="%H:%M:%S", errors="coerce", utc=False).dt.time
-        return pd.to_datetime(ds.dt.date.astype(str) + " " + pd.Series(ts).astype(str), utc=False)
-
-    def _load_candles_and_indicators(self):
-        """
-        Load candle CSV with columns: Date, Timestamp, Open, High, Low, Close, Volume
-        Compute TA-Lib indicators on Close/High/Low.
-        Stores result in self.bars with a 'bar_time' column (the bar close time).
-        """
-        bars = pd.read_csv(self.candles_file)
-        # normalize column names (case-sensitive exact names as per your sample)
-        required = ["Date","Timestamp","Open","High","Low","Close"]
-        for c in required:
-            if c not in bars.columns:
-                raise ValueError(f"Missing '{c}' in candles file.")
-
-        bars["bar_time"] = self._ensure_datetime(bars["Date"], bars["Timestamp"])
-        bars = bars.sort_values("bar_time").reset_index(drop=True)
-
-        close = bars["Close"].astype(float).values
-        high  = bars["High"].astype(float).values
-        low   = bars["Low"].astype(float).values
-
-        # --- TA-Lib indicators ---
-        bars["sma50"]     = ta.SMA(close, timeperiod=50)
-        bars["ema12"]     = ta.EMA(close, timeperiod=12)
-        bars["ema26"]     = ta.EMA(close, timeperiod=26)
-        macd, macd_sig, _ = ta.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
-        bars["macd"]      = macd
-        bars["macd_sig"]  = macd_sig
-        bars["rsi14"]     = ta.RSI(close, timeperiod=14)
-        bars["atr14"]     = ta.ATR(high, low, close, timeperiod=14)
-
-        # simple bar return for context
-        bars["ret1"]      = pd.Series(close).pct_change().fillna(0.0)
-
-        self.bars = bars  # keep all columns
-
-    def _compute_warmup(self):
-        """
-        Longest indicator lookback + window padding to avoid NaNs in obs.
-        EMA needs extra stabilization.
-        """
-        raw_lookback   = max(50, 26, 14)  # SMA50, EMA26, RSI14
-        ema_stabilize  = 3 * 26           # ~3× longest EMA period
-        self.warmup_bars = max(raw_lookback, ema_stabilize) + (self.window_len - 1)
-
-    def _parse_tick_time(self, df):
-        """
-        Tries to build a datetime column named 'tick_time' from ticks df.
-        Supports:
-        - Date + Timestamp columns (like bars)
-        - or a single Timestamp containing full datetime
-        """
-        if "Date" in df.columns and "Timestamp" in df.columns:
-            tick_time = self._ensure_datetime(df["Date"], df["Timestamp"])
-        else:
-            # try to parse a single full datetime column
-            tcol = None
-            for c in ["Timestamp","timestamp","Time","time","Datetime","datetime"]:
-                if c in df.columns:
-                    tcol = c
-                    break
-            if tcol is None:
-                raise ValueError("No time column found in tick file.")
-            tick_time = pd.to_datetime(df[tcol], errors="coerce", utc=False)
-        if tick_time.isna().any():
-            raise ValueError("Failed to parse some tick timestamps.")
-        return tick_time
-
-    def _prepare_tick_bar_alignment(self):
-        """
-        Build arrays:
-        self.ticks_meta            - minimal tick dataframe with tick_time
-        self.bar_idx_for_tick[i]  - bar index for the i-th kept tick
-        self.abs_tick_indices[i]  - absolute row index in the original tick CSV for that kept tick
-        """
-        ticks = pd.read_csv(self.tick_file)
-        ticks["tick_time"] = self._parse_tick_time(ticks)
-        ticks = ticks.sort_values("tick_time").reset_index(drop=True)
-
-        bar_times  = self.bars["bar_time"].values.astype("datetime64[ns]")
-        tick_times = ticks["tick_time"].values.astype("datetime64[ns]")
-
-        # For each tick, find rightmost bar with bar_time <= tick_time
-        bar_idx_for_tick = np.searchsorted(bar_times, tick_times, side="right") - 1
-
-        # Keep only ticks that occur after warmup bars
-        valid = bar_idx_for_tick >= self.warmup_bars
-        self.ticks_meta      = ticks.loc[valid, ["tick_time"]].reset_index(drop=True)
-        self.bar_idx_for_tick = bar_idx_for_tick[valid]
-        # map to absolute indices (row ids in the original sorted ticks df)
-        self.abs_tick_indices = np.where(valid)[0].astype(int)
