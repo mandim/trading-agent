@@ -1,0 +1,5 @@
+
+gymnasium
+torch
+tensorboard
+numpy
