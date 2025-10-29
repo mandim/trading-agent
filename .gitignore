@@ -218,3 +218,7 @@ __marimo__/
 
 # Cached folder
 cache_fx_EURUSD_D1/
+
+runs/
+
+*.pt
