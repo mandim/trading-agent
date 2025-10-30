@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 
 # import the environment
 from trading_env_gym import TradingEnv
@@ -69,6 +70,20 @@ def human_time(seconds):
     if m: return f"{m:d}m {s:02d}s"
     return f"{s:d}s"
 
+def _make_tb_writer(base_dir: str, run_tag: str | None = None, clean: bool = False):
+    """
+    Creates a fresh timestamped run directory inside base_dir and returns (writer, run_dir).
+    If clean=True, deletes the entire base_dir first.
+    """
+    if clean and os.path.exists(base_dir):
+        shutil.rmtree(base_dir)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = stamp + (f"_{run_tag}" if run_tag else "")
+    run_dir = os.path.join(base_dir, name)
+    os.makedirs(run_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=run_dir)
+    return writer, run_dir
+
 def train(steps=1_000_000,
           batch_size=256,
           gamma=0.998,
@@ -81,14 +96,23 @@ def train(steps=1_000_000,
           eval_every=50_000,
           logdir="runs/dqn",
           log_every_steps=5_000,
-          print_episode_end=True):
+          print_episode_end=True,
+          run_tag="DQN",
+          clean_logs=False):
     """
     Trains Double-DQN and prints frequent progress messages.
     - log_every_steps: console progress interval (steps)
     - print_episode_end: print a short one-liner when an episode ends
+    - run_tag: appended to the timestamped TB run folder for readability
+    - clean_logs: if True, deletes `logdir` before creating the new run
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    writer = SummaryWriter(logdir)
+
+    # ===== NEW: fresh TensorBoard run directory (timestamped) =====
+    writer, run_dir = _make_tb_writer(logdir, run_tag=run_tag, clean=clean_logs)
+    print("="*70)
+    print(f"TensorBoard run directory: {run_dir}")
+    print("="*70)
 
     env = make_env(eval_mode=False, reward_mode="pnl", normalize_prices=True, seed=123)
     obs_dim = env.observation_space.shape[0]
@@ -99,6 +123,12 @@ def train(steps=1_000_000,
     target.load_state_dict(online.state_dict())
     opt = torch.optim.Adam(online.parameters(), lr=lr)
     rb = Replay(cap=200_000)
+    
+    # policy & trade stats
+    action_counts = {"hold": 0, "buy": 0, "sell": 0}
+    wins = 0
+    trades = 0
+    sum_pnl_pips = 0.0
 
     # rolling trackers
     losses = collections.deque(maxlen=500)
@@ -118,6 +148,19 @@ def train(steps=1_000_000,
     last_print_t = start_wall
     last_print_step = 0
 
+    # ===== NEW: hparams summary =====
+    writer.add_hparams({
+        "batch_size": batch_size,
+        "gamma": gamma,
+        "lr": lr,
+        "start_training": start_training,
+        "target_tau": target_tau,
+        "eps_start": eps_start,
+        "eps_end": eps_end,
+        "eps_decay_steps": eps_decay_steps,
+        "eval_every": eval_every,
+    }, {})
+
     print("="*70)
     print(f"Starting training for {steps:,} steps | device={device} | obs_dim={obs_dim} | n_actions={n_actions}")
     print(f"Replay warmup: {start_training:,} | Eval every: {eval_every:,} steps | Log every: {log_every_steps:,} steps")
@@ -134,6 +177,18 @@ def train(steps=1_000_000,
                 a = int(q.argmax(dim=1).item())
 
         s2, r, terminated, truncated, info = env.step(a)
+        
+        # action mix
+        if a == 0: action_counts["hold"] += 1
+        elif a == 1: action_counts["buy"] += 1
+        elif a == 2: action_counts["sell"] += 1
+
+        # trade outcomes (only count when BUY/SELL)
+        if a in (1, 2):
+            trades += 1
+            if info.get("is_profitable", False): wins += 1
+            sum_pnl_pips += float(info.get("pnl_pips", 0.0))
+
         rb.push(s, a, r, s2, terminated, truncated)
         s = s2; ep_ret += r; ep_len += 1
 
@@ -153,6 +208,9 @@ def train(steps=1_000_000,
             d = torch.from_numpy(S).float().to(device)
             a_t = torch.from_numpy(A).long().to(device)
             r_t = torch.from_numpy(R).float().to(device)
+            
+            r_t = torch.clamp(r_t, -5.0, 5.0)
+            
             d2 = torch.from_numpy(S2).float().to(device)
             done = torch.from_numpy((T | U).astype(np.float32)).to(device)
 
@@ -164,11 +222,31 @@ def train(steps=1_000_000,
                 y = r_t + (1.0 - done) * gamma * next_q_target
 
             q = online(d).gather(1, a_t.unsqueeze(1)).squeeze(1)
+            
+            with torch.no_grad():
+                # average absolute Q
+                writer.add_scalar("train/avg_abs_Q", q.abs().mean().item(), step)
+            
+            td_errors = (q - y).detach().cpu().numpy()
+            # histogram (occasional to save space; e.g., every 1k steps)
+            if step % 1000 == 0:
+                writer.add_histogram("dist/td_error", td_errors, step)
+                writer.add_histogram("dist/Q_values", q.detach().cpu().numpy(), step)
+            
             loss = F.smooth_l1_loss(q, y)
             losses.append(loss.item())
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            
+            # gradient L2 norm (for stability)
+            total_norm = 0.0
+            for p in online.parameters():
+                if p.grad is not None:
+                    total_norm += p.grad.data.norm(2).item() ** 2
+            total_norm = total_norm ** 0.5
+            writer.add_scalar("train/grad_norm", total_norm, step)
+            
             nn.utils.clip_grad_norm_(online.parameters(), 1.0)
             opt.step()
 
@@ -193,6 +271,22 @@ def train(steps=1_000_000,
                   f"avg_loss={avg_loss:8.5f}  avg_ep_ret={avg_ret:8.3f}  ETA={human_time(eta)}")
             last_print_t = now
             last_print_step = step
+            
+            # replay size
+            writer.add_scalar("replay/size", len(rb), step)
+
+            # action fractions (avoid div-by-zero)
+            total_actions = sum(action_counts.values()) or 1
+            writer.add_scalar("policy/frac_hold", action_counts["hold"] / total_actions, step)
+            writer.add_scalar("policy/frac_buy",  action_counts["buy"]  / total_actions, step)
+            writer.add_scalar("policy/frac_sell", action_counts["sell"] / total_actions, step)
+
+            # trade KPIs
+            if trades > 0:
+                writer.add_scalar("trades/win_rate", wins / trades, step)
+                writer.add_scalar("trades/avg_pnl_pips", sum_pnl_pips / trades, step)
+            # env-side risk metric
+            writer.add_scalar("risk/max_drawdown", float(info.get("max_drawdown", 0.0)), step)
 
         # --- evaluation ---
         if step % eval_every == 0 and len(rb) >= start_training:
@@ -243,14 +337,16 @@ if __name__ == "__main__":
         steps=300_000,
         batch_size=256,
         gamma=0.998,
-        lr=3e-4,
-        start_training=5_000,
-        target_tau=0.01,
+        lr=1e-4,
+        start_training=20_000,
+        target_tau=0.005,
         eps_start=1.0,
         eps_end=0.05,
         eps_decay_steps=150_000,
         eval_every=50_000,
         logdir="runs/dqn",
         log_every_steps=5_000,
-        print_episode_end=True
+        print_episode_end=True,
+        run_tag="DQN_fx",      # NEW: label visible in TensorBoard
+        clean_logs=False       # NEW: set True to wipe `runs/dqn` before this run
     )
