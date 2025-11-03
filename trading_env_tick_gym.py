@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 import gymnasium as gym
@@ -6,7 +5,7 @@ from gymnasium import spaces
 
 class TradingEnvTick(gym.Env):
     """
-    Tick-by-tick environment with persistent positions.
+    Tick-by-tick environment with persistent positions, NO auto TP/SL.
 
     - One step = advance by ONE tick.
     - Actions (Discrete(4)):
@@ -20,10 +19,13 @@ class TradingEnvTick(gym.Env):
         * Short MTM on ASK, entry at BID.
 
     - Reward:
-        * Per-tick change in (realized + unrealized) PnL in USD (or normalized),
-          i.e., r_t = (equity_t - equity_{t-1}) / denom.
-        * TP/SL can auto-close the position.
-        * Optional small time penalty while holding to discourage over-holding.
+        * r_t = (equity_t - equity_{t-1}) / risk_per_trade_usd
+        * Optional small time penalty while holding.
+        * Optional drawdown penalty and/or early stop.
+
+    - NO TP/SL:
+        * The agent must explicitly CLOSE to realize PnL.
+        * TP/SL kwargs are accepted but ignored (backward compatibility).
 
     - Episode termination:
         * End of data, max_steps_per_episode, equity <= 0, or max drawdown stop.
@@ -37,23 +39,23 @@ class TradingEnvTick(gym.Env):
         tick_file: str,
         cache_dir: str = "cache_fx_EURUSD_D1",
         window_len: int = 32,
-        tp_pips: float = 50.0,
-        sl_pips: float = 50.0,
+        # Deprecated (ignored) but kept for compatibility:
+        tp_pips: float | None = None,
+        sl_pips: float | None = None,
         lot: float = 1.0,
         risk_per_trade_usd: float = 1000.0,
-        dd_penalty_lambda: float = 0.0,      # 0 by default for tick mode (optional)
+        dd_penalty_lambda: float = 0.0,
         max_dd_stop: float = 0.30,
         max_steps_per_episode: int = 10_000,
         normalize_prices: bool = True,
-        time_penalty_per_step: float = 0.0,  # small negative reward per tick while holding
+        time_penalty_per_step: float = 0.0,
         seed: int | None = None,
     ):
         super().__init__()
 
         self.pip_decimal = float(pip_decimal)
         self.window_len = int(window_len)
-        self.tp_pips = float(tp_pips)
-        self.sl_pips = float(sl_pips)
+        # tp/sl intentionally unused
         self.lot = float(lot)
         self.risk_per_trade_usd = float(risk_per_trade_usd)
         self.dd_penalty_lambda = float(dd_penalty_lambda)
@@ -65,13 +67,12 @@ class TradingEnvTick(gym.Env):
         self.cache_dir = cache_dir
         self._load_cache(cache_dir)
 
-        # Spaces
         # obs = bars window + [ask,bid,spread, pos_flag, pos_dir, entry_price_norm, time_in_pos_norm, unrealized_pnl_pips]
         self.extra_feats = 8
         self.obs_dim = self.window_len * self.n_feats + self.extra_feats
         high = np.full((self.obs_dim,), 1e6, dtype=np.float32)
         self.observation_space = spaces.Box(low=-high, high=high, dtype=np.float32)
-        self.action_space = spaces.Discrete(4)  # HOLD, OPEN_LONG, OPEN_SHORT, CLOSE
+        self.action_space = spaces.Discrete(4)
 
         # RNG
         self.np_rng = np.random.default_rng(seed if seed is not None else 0)
@@ -100,7 +101,6 @@ class TradingEnvTick(gym.Env):
         # pick starting tick after warmup
         min_bar = self.window_len - 1
         base = int(np.searchsorted(self.tick_to_bar, min_bar, side="left"))
-        # random start anywhere with room for an episode
         hi = max(base + 1, self.n_ticks - self.max_steps_per_episode - 2)
         self.t = int(self.np_rng.integers(low=base, high=hi, endpoint=False))
         self.prev_equity = self._mark_to_equity()  # for delta-reward
@@ -141,18 +141,9 @@ class TradingEnvTick(gym.Env):
         else:
             self.t += 1
 
-        # auto TP/SL
-        if self.position_open and not self.terminated:
-            px_ask = float(self.tick_ask[self.t])
-            px_bid = float(self.tick_bid[self.t])
-            if self.pos_dir > 0:  # long TP/SL versus BID
-                if px_bid >= self.tp_price or px_bid <= self.sl_price:
-                    self._close_position(mtm_tick=self.t)  # realized at MTM price
-            else:  # short TP/SL versus ASK
-                if px_ask <= self.tp_price or px_ask >= self.sl_price:
-                    self._close_position(mtm_tick=self.t)
+        # NO auto TP/SL here (agent must close)
 
-        # compute reward = delta equity / denom - optional dd penalty - (time penalty if holding)
+        # reward = delta equity / denom - optional dd penalty - (time penalty if holding)
         current_equity = self._mark_to_equity()
         pnl_delta = current_equity - self.prev_equity
         self.prev_equity = current_equity
@@ -178,8 +169,9 @@ class TradingEnvTick(gym.Env):
             "position_open": self.position_open,
             "pos_dir": self.pos_dir,
             "entry_price": self.entry_price if self.position_open else None,
-            "tp_price": self.tp_price if self.position_open else None,
-            "sl_price": self.sl_price if self.position_open else None,
+            # kept for compatibility; always None in this no-TP/SL variant
+            "tp_price": None,
+            "sl_price": None,
             "equity": current_equity,
             "balance": self.balance,
             "unrealized_pnl_pips": self._unrealized_pnl_pips(self.t) if self.position_open else 0.0,
@@ -192,21 +184,15 @@ class TradingEnvTick(gym.Env):
     def _open_position(self, direction: int):
         self.position_open = True
         self.pos_dir = 1 if direction > 0 else -1
-        # entry price at current tick
         ask = float(self.tick_ask[self.t])
         bid = float(self.tick_bid[self.t])
         self.entry_price = ask if self.pos_dir > 0 else bid
         self.entry_tick = self.t
-        # immediate MTM uses bid for long, ask for short -> spread realized naturally
-        if self.pos_dir > 0:
-            self.tp_price = self.entry_price + self.tp_pips * self.pip_decimal
-            self.sl_price = self.entry_price - self.sl_pips * self.pip_decimal
-        else:
-            self.tp_price = self.entry_price - self.tp_pips * self.pip_decimal
-            self.sl_price = self.entry_price + self.sl_pips * self.pip_decimal
+        # keep attributes for compatibility, but unused
+        self.tp_price = None
+        self.sl_price = None
 
     def _close_position(self, mtm_tick: int):
-        # realize PnL at MTM
         pnl = self._unrealized_pnl_usd(mtm_tick)
         self.balance = max(0.0, self.balance + pnl)
         self.position_open = False
@@ -215,7 +201,6 @@ class TradingEnvTick(gym.Env):
         self.entry_tick = None
         self.tp_price = None
         self.sl_price = None
-        # update equity peak / dd trackers
         self._update_drawdown(self.balance)
 
     def _unrealized_pnl_pips(self, tick_idx: int) -> float:
@@ -224,10 +209,8 @@ class TradingEnvTick(gym.Env):
         ask = float(self.tick_ask[tick_idx])
         bid = float(self.tick_bid[tick_idx])
         if self.pos_dir > 0:
-            # long: MTM at bid
             return (bid - self.entry_price) / self.pip_decimal
         else:
-            # short: MTM at ask
             return (self.entry_price - ask) / self.pip_decimal
 
     def _unrealized_pnl_usd(self, tick_idx: int) -> float:
@@ -262,9 +245,12 @@ class TradingEnvTick(gym.Env):
 
         pos_flag = 1.0 if self.position_open else 0.0
         pos_dir = float(self.pos_dir)
-        entry_norm = 0.0 if self.entry_price is None else self._norm(self.entry_price, self.ask_mean if self.pos_dir>0 else self.bid_mean,
-                                                                      self.ask_std if self.pos_dir>0 else self.bid_std)
-        time_in_pos = 0.0 if self.entry_tick is None else min(1.0, (tick_idx - self.entry_tick) / 5000.0)  # crude scale
+        entry_norm = 0.0 if self.entry_price is None else self._norm(
+            self.entry_price,
+            self.ask_mean if self.pos_dir>0 else self.bid_mean,
+            self.ask_std  if self.pos_dir>0 else self.bid_std
+        )
+        time_in_pos = 0.0 if self.entry_tick is None else min(1.0, (tick_idx - self.entry_tick) / 5000.0)
         upnl_pips = self._unrealized_pnl_pips(tick_idx) if self.position_open else 0.0
 
         obs = np.hstack([

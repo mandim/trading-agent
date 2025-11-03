@@ -185,6 +185,8 @@ class TradingEnv(gym.Env):
     def step(self, action: int):
         if self.terminated or self.truncated:
             return self._get_observation(self.t), 0.0, self.terminated, self.truncated, {"note": "episode already ended"}
+        
+        closed_trade = False
 
         # End of data guard
         if self.t >= self.n_ticks - 1:
@@ -208,7 +210,17 @@ class TradingEnv(gym.Env):
             self.steps += 1
             if self.steps >= self.max_steps_per_episode:
                 self.truncated = True
-            return self._get_observation(self.t), 0.0, False, self.truncated, {"action": "HOLD"}
+            obs = self._get_observation(self.t)
+            info = {
+                "action": "HOLD",
+                "balance": self.balance,
+                "equity": self._equity_mtm(),   # NEW
+                "equity_peak": self.equity_peak,
+                "max_drawdown": self.max_drawdown,
+                "closed_trade": False           # NEW
+            }
+            
+            return obs, 0.0, False, self.truncated, info
 
         # Entry prices
         entry_ask = float(self.tick_ask[self.t])
@@ -232,7 +244,8 @@ class TradingEnv(gym.Env):
                 if px <= sl_value:
                     is_profitable = False; break
             self.t = k
-            pnl_pips = (float(self.tick_bid[self.t]) - entry) / self.pip_decimal - spread_once
+            # pnl_pips = (float(self.tick_bid[self.t]) - entry) / self.pip_decimal - spread_once
+            pnl_pips = (float(self.tick_bid[self.t]) - entry) / self.pip_decimal
 
         else:  # SELL
             entry = entry_bid
@@ -246,7 +259,8 @@ class TradingEnv(gym.Env):
                 if px >= sl_value:
                     is_profitable = False; break
             self.t = k
-            pnl_pips = (entry - float(self.tick_ask[self.t])) / self.pip_decimal - spread_once
+            # pnl_pips = (entry - float(self.tick_ask[self.t])) / self.pip_decimal - spread_once
+            pnl_pips = (entry - float(self.tick_ask[self.t])) / self.pip_decimal
 
         # EOF without TP/SL
         if is_profitable is None:
@@ -267,12 +281,14 @@ class TradingEnv(gym.Env):
             "tp": tp_value,
             "sl": sl_value,
             "final_idx": self.t,
-            "equity": self.equity,
+            "balance": self.balance,             # balance changes only when trade closes (your env closes per step)
+            "equity": self._equity_mtm(),        # NEW: mark-to-market equity
             "equity_peak": self.equity_peak,
             "max_drawdown": self.max_drawdown,
             "is_profitable": bool(is_profitable),
             "pnl_pips": float(pnl_pips),
             "eof": (self.t >= self.n_ticks - 1),
+            "closed_trade": True,        # NEW
         }
         return obs, float(reward), self.terminated, self.truncated, info
 
@@ -316,11 +332,12 @@ class TradingEnv(gym.Env):
 
         # Balance & equity
         self.balance = max(0.0, self.balance + profit)
-        self.equity = self.balance
-        if self.equity > self.equity_peak:
-            self.equity_peak = self.equity
 
-        dd_now = 0.0 if self.equity_peak <= 0 else (self.equity_peak - self.equity) / (self.equity_peak + 1e-9)
+        # equity is mark-to-market (no open position here, so equals balance)
+        equity_now = self._equity_mtm()
+        if equity_now > self.equity_peak:
+            self.equity_peak = equity_now
+        dd_now = 0.0 if self.equity_peak <= 0 else (self.equity_peak - equity_now) / (self.equity_peak + 1e-9)
         dd_now = max(0.0, dd_now)
         new_dd_increment = max(0.0, dd_now - self.max_drawdown)
         if dd_now > self.max_drawdown:
@@ -337,6 +354,11 @@ class TradingEnv(gym.Env):
 
         return float(reward)
 
+    # --- NEW: mark-to-market equity (no open positions in this env, so equals balance) ---
+    def _equity_mtm(self) -> float:
+        return float(self.balance)
+
+    
     # ----------------------------- Data loading ------------------------------------
     def _load_cache(self, cache_dir: str):
         needed = ["bars_features.npy", "bar_times.npy", "tick_ask.npy", "tick_bid.npy", "tick_to_bar.npy"]

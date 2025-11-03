@@ -1,4 +1,3 @@
-
 import os, math, random, collections, time, shutil, sys
 import numpy as np
 import torch
@@ -44,14 +43,15 @@ def soft_update(target, online, tau):
             tp.data.mul_(1 - tau).add_(tau * p.data)
 
 def make_env(eval_mode=False, reward_mode="pnl", normalize_prices=True, seed=123):
-    env = TradingEnv(
+    # tp_pips/sl_pips are accepted but ignored in the no-TP/SL env (kept for compatibility).
+    env = TradingEnvTick(
         pip_decimal=0.0001,
         candles_file="unused.csv",
         tick_file="unused.csv",
         cache_dir="cache_fx_EURUSD_D1",
-        reward_mode=reward_mode,
+        # reward_mode=reward_mode,
         normalize_prices=normalize_prices,
-        eval_mode=eval_mode,
+        # eval_mode=eval_mode,
         max_steps_per_episode=5000,
         window_len=32,
         tp_pips=50.0,
@@ -61,6 +61,8 @@ def make_env(eval_mode=False, reward_mode="pnl", normalize_prices=True, seed=123
         dd_penalty_lambda=1.0,
         max_dd_stop=0.30,
         seed=seed,
+        # tip: you can try a small holding cost to discourage endless positions
+        # time_penalty_per_step=1e-4,
     )
     return env
 
@@ -86,6 +88,53 @@ def _make_tb_writer(base_dir: str, run_tag: str | None = None, clean: bool = Fal
     writer = SummaryWriter(log_dir=run_dir)
     return writer, run_dir
 
+# ----------------- Policy helpers (masking + bias to CLOSE) -----------------
+def masked_argmax(q_values: torch.Tensor, valid_mask: torch.Tensor) -> int:
+    """
+    q_values: shape (1, n_actions)
+    valid_mask: shape (n_actions,), dtype=bool; True means action is valid.
+    """
+    q = q_values.clone()
+    # set invalid actions to a very low value
+    invalid = ~valid_mask
+    q[0, invalid] = q[0, invalid] - 1e9
+    return int(q.argmax(dim=1).item())
+
+def valid_actions_mask(position_open: bool, n_actions: int = 4) -> torch.Tensor:
+    # actions: 0=HOLD always valid, 1=OPEN_LONG, 2=OPEN_SHORT, 3=CLOSE
+    mask = torch.ones(n_actions, dtype=torch.bool)
+    if position_open:
+        # cannot open when already holding
+        mask[1] = False
+        mask[2] = False
+    else:
+        # cannot close when flat
+        mask[3] = False
+    return mask
+
+def select_action(qnet, obs, epsilon, device, prev_info):
+    """
+    ε-greedy:
+      - Greedy branch: mask invalid actions to avoid learning on NOOPs.
+      - Explore branch: slight bias to try CLOSE when holding.
+    """
+    holding = bool(prev_info.get("position_open", False)) if prev_info is not None else False
+
+    if random.random() < epsilon:
+        # exploration with a small nudge to CLOSE while holding
+        if holding and random.random() < 0.50:
+            return 3  # CLOSE
+        # otherwise random among valid actions
+        mask = valid_actions_mask(holding, n_actions=4).cpu().numpy()
+        valid_idxs = np.nonzero(mask)[0]
+        return int(np.random.choice(valid_idxs))
+    else:
+        with torch.no_grad():
+            q = qnet(torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0))
+            mask = valid_actions_mask(holding, n_actions=q.shape[1]).to(q.device)
+            return masked_argmax(q, mask)
+
+# ----------------- Training -----------------
 def train(steps=1_000_000,
           batch_size=256,
           gamma=0.998,
@@ -126,11 +175,8 @@ def train(steps=1_000_000,
     opt = torch.optim.Adam(online.parameters(), lr=lr)
     rb = Replay(cap=200_000)
     
-    # policy & trade stats
-    action_counts = {"hold": 0, "buy": 0, "sell": 0}
-    wins = 0
-    trades = 0
-    sum_pnl_pips = 0.0
+    # policy & counts
+    action_counts = {"hold": 0, "buy": 0, "sell": 0, "close": 0}
 
     # rolling trackers
     losses = collections.deque(maxlen=500)
@@ -142,6 +188,7 @@ def train(steps=1_000_000,
         return eps_start + t * (eps_end - eps_start)
 
     s, info = env.reset(seed=123)
+    prev_info = info
     ep_ret, ep_len = 0.0, 0
     best_eval = -1e9
 
@@ -169,40 +216,29 @@ def train(steps=1_000_000,
     print("="*70)
 
     for step in range(1, steps + 1):
-        # ε-greedy policy
+        # ε-greedy with masking + close-bias while holding
         e = epsilon(step)
-        if random.random() < e:
-            a = env.action_space.sample()
-        else:
-            with torch.no_grad():
-                q = online(torch.from_numpy(s).float().unsqueeze(0).to(device))
-                a = int(q.argmax(dim=1).item())
+        a = select_action(online, s, e, device, prev_info)
 
         s2, r, terminated, truncated, info = env.step(a)
-        
-        # --- NEW: env accounting logs ---
-        # mark-to-market equity every step
-        if "equity" in info:
-            writer.add_scalar("env/equity_mark_to_market", float(info["equity"]), step)
 
-        # balance only when a trade actually closed (BUY/SELL path in env)
-        if info.get("closed_trade", False) and "balance" in info:
-            writer.add_scalar("env/balance_close_only", float(info["balance"]), step)
-        # ---------------------------------
-        
+        # --- env accounting logs (every step) ---
+        if "equity" in info:
+            writer.add_scalar("env/equity", float(info["equity"]), step)
+        if "balance" in info:
+            writer.add_scalar("env/balance", float(info["balance"]), step)
+        writer.add_scalar("env/position_open", float(info.get("position_open", False)), step)
+        writer.add_scalar("env/unrealized_pnl_pips", float(info.get("unrealized_pnl_pips", 0.0)), step)
+
         # action mix
         if a == 0: action_counts["hold"] += 1
         elif a == 1: action_counts["buy"] += 1
         elif a == 2: action_counts["sell"] += 1
-
-        # trade outcomes (only count when BUY/SELL)
-        if a in (1, 2):
-            trades += 1
-            if info.get("is_profitable", False): wins += 1
-            sum_pnl_pips += float(info.get("pnl_pips", 0.0))
+        elif a == 3: action_counts["close"] += 1
 
         rb.push(s, a, r, s2, terminated, truncated)
         s = s2; ep_ret += r; ep_len += 1
+        prev_info = info  # for next step's masking/bias
 
         if terminated or truncated:
             # episode logs
@@ -212,6 +248,7 @@ def train(steps=1_000_000,
             if print_episode_end:
                 print(f"[episode end] step={step:,}  ep_return={ep_ret:.3f}  ep_len={ep_len}  buffer={len(rb):,}")
             s, info = env.reset()
+            prev_info = info
             ep_ret, ep_len = 0.0, 0
 
         # Learn
@@ -220,7 +257,8 @@ def train(steps=1_000_000,
             d = torch.from_numpy(S).float().to(device)
             a_t = torch.from_numpy(A).long().to(device)
             r_t = torch.from_numpy(R).float().to(device)
-            
+
+            # mild clipping to stabilize
             r_t = torch.clamp(r_t, -5.0, 5.0)
             
             d2 = torch.from_numpy(S2).float().to(device)
@@ -236,11 +274,9 @@ def train(steps=1_000_000,
             q = online(d).gather(1, a_t.unsqueeze(1)).squeeze(1)
             
             with torch.no_grad():
-                # average absolute Q
                 writer.add_scalar("train/avg_abs_Q", q.abs().mean().item(), step)
             
             td_errors = (q - y).detach().cpu().numpy()
-            # histogram (occasional to save space; e.g., every 1k steps)
             if step % 1000 == 0:
                 writer.add_histogram("dist/td_error", td_errors, step)
                 writer.add_histogram("dist/Q_values", q.detach().cpu().numpy(), step)
@@ -250,7 +286,7 @@ def train(steps=1_000_000,
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
-            
+
             # gradient L2 norm (for stability)
             total_norm = 0.0
             for p in online.parameters():
@@ -289,14 +325,11 @@ def train(steps=1_000_000,
 
             # action fractions (avoid div-by-zero)
             total_actions = sum(action_counts.values()) or 1
-            writer.add_scalar("policy/frac_hold", action_counts["hold"] / total_actions, step)
-            writer.add_scalar("policy/frac_buy",  action_counts["buy"]  / total_actions, step)
-            writer.add_scalar("policy/frac_sell", action_counts["sell"] / total_actions, step)
+            writer.add_scalar("policy/frac_hold",  action_counts["hold"]  / total_actions, step)
+            writer.add_scalar("policy/frac_buy",   action_counts["buy"]   / total_actions, step)
+            writer.add_scalar("policy/frac_sell",  action_counts["sell"]  / total_actions, step)
+            writer.add_scalar("policy/frac_close", action_counts["close"] / total_actions, step)
 
-            # trade KPIs
-            if trades > 0:
-                writer.add_scalar("trades/win_rate", wins / trades, step)
-                writer.add_scalar("trades/avg_pnl_pips", sum_pnl_pips / trades, step)
             # env-side risk metric
             writer.add_scalar("risk/max_drawdown", float(info.get("max_drawdown", 0.0)), step)
 
@@ -331,15 +364,19 @@ def evaluate(policy_net: nn.Module, episodes=5, device="cpu"):
     ret_sum, len_sum = 0.0, 0
     for ep in range(episodes):
         s, info = env.reset()
-        ep_ret, ep_len = 0.0, 0
         done = False
+        ep_ret, ep_len = 0.0, 0
+        prev_info = info
         while not done:
             with torch.no_grad():
                 q = policy_net(torch.from_numpy(s).float().unsqueeze(0).to(device))
-                a = int(q.argmax(dim=1).item())
+                # greedy with masking (no exploration bias in eval)
+                mask = valid_actions_mask(bool(prev_info.get("position_open", False)), n_actions=q.shape[1]).to(q.device)
+                a = masked_argmax(q, mask)
             s, r, term, trunc, info = env.step(a)
             done = term or trunc
             ep_ret += r; ep_len += 1
+            prev_info = info
         ret_sum += ep_ret; len_sum += ep_len
     return ret_sum / episodes, len_sum / episodes
 
@@ -359,6 +396,6 @@ if __name__ == "__main__":
         logdir="runs/dqn",
         log_every_steps=5_000,
         print_episode_end=True,
-        run_tag="DQN_fx",      # NEW: label visible in TensorBoard
-        clean_logs=False       # NEW: set True to wipe `runs/dqn` before this run
+        run_tag="DQN_fx",      # label visible in TensorBoard
+        clean_logs=False       # set True to wipe `runs/dqn` before this run
     )
