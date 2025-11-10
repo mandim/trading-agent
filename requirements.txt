@@ -1,5 +1,0 @@
-
-gymnasium
-torch
-tensorboard
-numpy
