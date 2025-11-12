@@ -1,7 +1,7 @@
 import zmq
 from typing import Any, Optional
 import time
-from trading_env import TradingEnv
+from trading_env_merged import TradingEnv
 
 class ZMQReqClient:
     """Tiny REQ client for testing the server."""
