@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 
-# import the merged environment
+# import the merged, cost-aware environment
 from trading_env_merged import TradingEnv
 
 
@@ -17,6 +17,7 @@ class QNet(nn.Module):
         self.fc1 = nn.Linear(obs_dim, 512)
         self.fc2 = nn.Linear(512, 256)
         self.fc3 = nn.Linear(256, n_actions)
+
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
@@ -27,17 +28,22 @@ class QNet(nn.Module):
 class Replay:
     def __init__(self, cap=200_000):
         self.buf = collections.deque(maxlen=cap)
+
     def push(self, s, a, r, s2, term, trunc):
         self.buf.append((s, a, r, s2, term, trunc))
+
     def sample(self, bs):
         batch = random.sample(self.buf, bs)
         s, a, r, s2, te, tr = zip(*batch)
-        return (np.stack(s),
-                np.array(a),
-                np.array(r, dtype=np.float32),
-                np.stack(s2),
-                np.array(te, dtype=np.bool_),
-                np.array(tr, dtype=np.bool_))
+        return (
+            np.stack(s),
+            np.array(a),
+            np.array(r, dtype=np.float32),
+            np.stack(s2),
+            np.array(te, dtype=np.bool_),
+            np.array(tr, dtype=np.bool_),
+        )
+
     def __len__(self):
         return len(self.buf)
 
@@ -52,26 +58,49 @@ def soft_update(target, online, tau):
 def make_env(seed=123, eval_mode=False, reset_balance_each_episode=True):
     """
     Single source of truth for env config (train & eval).
+
+    Configured to emulate FP Markets RAW account:
+      - Realistic TP/SL R-structure
+      - Spread cost applied once per trade
+      - Commission per lot per side
+      - Swaps / slippage configurable
     """
     env = TradingEnv(
         pip_decimal=0.0001,
         candles_file="unused.csv",
         tick_file="unused.csv",
-        cache_dir="cache_fx_EURUSD_D1",
+        cache_dir="cache_fx_EURUSD_D1_2020_2025",
 
         # trading
         tp_pips=50.0,
         sl_pips=50.0,
-        lot=0.1,
+        lot=1.0,
         start_balance=100_000.0,
         reset_balance_each_episode=reset_balance_each_episode,
-        include_spread_cost=False,
+        include_spread_cost=True,   # pay spread once per trade
         exchange_rate=1.0,
+
+        # BROKER COST MODEL (FP Markets RAW-style)
+        account_type="raw",                 # "raw" -> default 3$ per lot per side
+        enable_commission=True,
+        # override if needed:
+        # commission_per_lot_per_side_usd=3.0,
+
+        enable_swaps=True,                 # set True + rates if you want swaps in training
+        swap_long_pips_per_day=-0.971,  # EURUSD long
+        swap_short_pips_per_day=0.45,   # EURUSD short
+
+        # conservative slippage model; tune per your tests
+        slippage_mode="uniform",       # or "fixed" / "normal"
+        slippage_pips_open=0.2,       # typical max / std in pips
+        slippage_pips_close=0.2,
+
+        other_fixed_cost_per_trade_usd=0.0,
 
         # risk & reward
         dd_penalty_lambda=1.0,
         max_dd_stop=0.30,
-        reward_mode="risk",          # "risk" or "pnl"
+        reward_mode="risk",          # "risk" (R-based) or "pnl" (USD-based)
         risk_per_trade_usd=1000.0,
 
         # episodes / split
@@ -84,7 +113,7 @@ def make_env(seed=123, eval_mode=False, reset_balance_each_episode=True):
         normalize_prices=True,
         normalize_bars=True,
 
-        # misc
+        # runtime
         start_server=False,
         seed=seed,
     )
@@ -95,8 +124,10 @@ def human_time(seconds):
     seconds = max(0, int(seconds))
     m, s = divmod(seconds, 60)
     h, m = divmod(m, 60)
-    if h: return f"{h:d}h {m:02d}m {s:02d}s"
-    if m: return f"{m:d}m {s:02d}s"
+    if h:
+        return f"{h:d}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m:d}m {s:02d}s"
     return f"{s:d}s"
 
 
@@ -112,21 +143,23 @@ def _make_tb_writer(base_dir: str, run_tag: str | None = None, clean: bool = Fal
 
 
 # ----------------- Training Loop -----------------
-def train(steps=1_000_000,
-          batch_size=256,
-          gamma=0.998,
-          lr=1e-4,
-          start_training=10_000,
-          target_tau=0.01,
-          eps_start=1.0,
-          eps_end=0.1,
-          eps_decay_steps=300_000,
-          eval_every=50_000,
-          logdir="runs/dqn",
-          log_every_steps=5_000,
-          print_episode_end=True,
-          run_tag="DQN_fx",
-          clean_logs=False):
+def train(
+    steps=1_000_000,
+    batch_size=256,
+    gamma=0.998,
+    lr=1e-4,
+    start_training=10_000,
+    target_tau=0.01,
+    eps_start=1.0,
+    eps_end=0.1,
+    eps_decay_steps=300_000,
+    eval_every=50_000,
+    logdir="runs/dqn",
+    log_every_steps=5_000,
+    print_episode_end=True,
+    run_tag="DQN_fx",
+    clean_logs=False,
+):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -145,13 +178,18 @@ def train(steps=1_000_000,
     opt = torch.optim.Adam(online.parameters(), lr=lr)
     rb = Replay(cap=200_000)
 
-    # Session-level PnL / risk accumulators
+    # Session-level accumulators (using NET PnL from env)
     cum_profit_usd = 0.0
     cum_profit_R = 0.0
     cum_loss_usd = 0.0
     cum_loss_R = 0.0
     cum_trades = 0
     session_start_balance = getattr(env, "start_balance", 100000.0)
+
+    # Cost components (for monitoring broker friction)
+    cum_commission_usd = 0.0
+    cum_swap_usd = 0.0
+    cum_other_costs_usd = 0.0
 
     # Policy stats
     action_counts = {"hold": 0, "buy": 0, "sell": 0}
@@ -170,20 +208,26 @@ def train(steps=1_000_000,
     s, info = env.reset(seed=123)
     ep_ret, ep_len = 0.0, 0
 
-    writer.add_hparams({
-        "batch_size": batch_size,
-        "gamma": gamma,
-        "lr": lr,
-        "start_training": start_training,
-        "target_tau": target_tau,
-        "eps_start": eps_start,
-        "eps_end": eps_end,
-        "eps_decay_steps": eps_decay_steps,
-        "eval_every": eval_every,
-    }, {})
+    writer.add_hparams(
+        {
+            "batch_size": batch_size,
+            "gamma": gamma,
+            "lr": lr,
+            "start_training": start_training,
+            "target_tau": target_tau,
+            "eps_start": eps_start,
+            "eps_end": eps_end,
+            "eps_decay_steps": eps_decay_steps,
+            "eval_every": eval_every,
+        },
+        {},
+    )
 
     print("=" * 70)
-    print(f"Starting training for {steps:,} steps | device={device} | obs_dim={obs_dim} | n_actions={n_actions}")
+    print(
+        f"Starting training for {steps:,} steps | device={device} | "
+        f"obs_dim={obs_dim} | n_actions={n_actions}"
+    )
     print("=" * 70)
 
     for step in range(1, steps + 1):
@@ -200,15 +244,28 @@ def train(steps=1_000_000,
         s2, r, terminated, truncated, info = env.step(a)
         done = bool(terminated or truncated)
 
-        # -------- Per-trade accounting (from env info) --------
+        # -------- Per-trade accounting (env already returns NET PnL) --------
         if info.get("closed_trade", False):
+            # Net after costs:
             trade_pnl_usd = float(info.get("profit", 0.0))
             trade_R = float(info.get("profit_R", 0.0))
             pnl_pips = float(info.get("pnl_pips", 0.0))
+
+            # Cost breakdown from env (if available)
+            commission_usd = float(info.get("commission_usd", 0.0))
+            swap_usd = float(info.get("swap_usd", 0.0))
+            other_cost_usd = float(info.get("other_cost_usd", 0.0))
+
             cum_trades += 1
             trades += 1
             sum_pnl_pips += pnl_pips
 
+            # Track costs
+            cum_commission_usd += commission_usd
+            cum_swap_usd += swap_usd
+            cum_other_costs_usd += other_cost_usd
+
+            # Split wins / losses on NET PnL
             if trade_pnl_usd >= 0:
                 cum_profit_usd += trade_pnl_usd
             else:
@@ -225,8 +282,11 @@ def train(steps=1_000_000,
             net_profit_usd = cum_profit_usd - cum_loss_usd
             net_profit_R = cum_profit_R - cum_loss_R
             session_equity = session_start_balance + net_profit_usd
-            profit_factor = (cum_profit_usd / cum_loss_usd) if cum_loss_usd > 0 else float("inf")
+            profit_factor = (
+                (cum_profit_usd / cum_loss_usd) if cum_loss_usd > 0 else float("inf")
+            )
 
+            # Session-level logs (net of costs)
             writer.add_scalar("session/cum_profit_usd", cum_profit_usd, step)
             writer.add_scalar("session/cum_loss_usd", cum_loss_usd, step)
             writer.add_scalar("session/net_profit_usd", net_profit_usd, step)
@@ -237,22 +297,38 @@ def train(steps=1_000_000,
             writer.add_scalar("session/cum_loss_R", cum_loss_R, step)
             writer.add_scalar("session/net_profit_R", net_profit_R, step)
 
-        # occasional histogram of trade PnL
+            # Cost logs
+            writer.add_scalar("costs/cum_commission_usd", cum_commission_usd, step)
+            writer.add_scalar("costs/cum_swap_usd", cum_swap_usd, step)
+            writer.add_scalar(
+                "costs/cum_other_costs_usd", cum_other_costs_usd, step
+            )
+
+        # occasional histogram of trade PnL (NET)
         if step % 2000 == 0 and info.get("closed_trade", False):
-            writer.add_histogram("session/trade_pnl_usd",
-                                 np.array([float(info.get("profit", 0.0))]),
-                                 step)
+            writer.add_histogram(
+                "session/trade_pnl_usd",
+                np.array([float(info.get("profit", 0.0))]),
+                step,
+            )
 
         # env-level logs
         if "equity" in info:
-            writer.add_scalar("env/equity_mark_to_market", float(info["equity"]), step)
+            writer.add_scalar(
+                "env/equity_mark_to_market", float(info["equity"]), step
+            )
         if info.get("closed_trade", False) and "balance" in info:
-            writer.add_scalar("env/balance_close_only", float(info["balance"]), step)
+            writer.add_scalar(
+                "env/balance_close_only", float(info["balance"]), step
+            )
 
         # action mix
-        if a == 0: action_counts["hold"] += 1
-        elif a == 1: action_counts["buy"] += 1
-        elif a == 2: action_counts["sell"] += 1
+        if a == 0:
+            action_counts["hold"] += 1
+        elif a == 1:
+            action_counts["buy"] += 1
+        elif a == 2:
+            action_counts["sell"] += 1
 
         # push to replay
         rb.push(s, a, r, s2, terminated, truncated)
@@ -266,7 +342,10 @@ def train(steps=1_000_000,
             writer.add_scalar("train/ep_length", ep_len, step)
             returns.append(ep_ret)
             if print_episode_end:
-                print(f"[episode end] step={step:,} ep_return={ep_ret:.3f} ep_len={ep_len} buf={len(rb):,}")
+                print(
+                    f"[episode end] step={step:,} "
+                    f"ep_return={ep_ret:.3f} ep_len={ep_len} buf={len(rb):,}"
+                )
             s, info = env.reset()
             ep_ret, ep_len = 0.0, 0
 
@@ -304,8 +383,12 @@ def train(steps=1_000_000,
             if step % 1000 == 0:
                 td_errors = (q - y).detach().cpu().numpy()
                 writer.add_histogram("dist/td_error", td_errors, step)
-                writer.add_histogram("dist/Q_values", q.detach().cpu().numpy(), step)
-                writer.add_scalar("train/avg_abs_Q", q.abs().mean().item(), step)
+                writer.add_histogram(
+                    "dist/Q_values", q.detach().cpu().numpy(), step
+                )
+                writer.add_scalar(
+                    "train/avg_abs_Q", q.abs().mean().item(), step
+                )
 
         # --------------- Periodic logging ---------------
         if (step % log_every_steps == 0) or (step == 1):
@@ -316,22 +399,44 @@ def train(steps=1_000_000,
             pct = 100.0 * step / float(steps)
             eta = (steps - step) / max(1e-6, sps)
 
-            print(f"[{step:>8}/{steps:,} | {pct:5.1f}%] "
-                  f"eps={e:.3f} buf={len(rb):>7} sps={sps:6.1f} ETA={human_time(eta)}")
+            print(
+                f"[{step:>8}/{steps:,} | {pct:5.1f}%] "
+                f"eps={e:.3f} buf={len(rb):>7} sps={sps:6.1f} "
+                f"ETA={human_time(eta)}"
+            )
 
             train._last_print_t = now
             train._last_print_step = step
 
             writer.add_scalar("replay/size", len(rb), step)
             total_actions = sum(action_counts.values()) or 1
-            writer.add_scalar("policy/frac_hold", action_counts["hold"] / total_actions, step)
-            writer.add_scalar("policy/frac_buy",  action_counts["buy"]  / total_actions, step)
-            writer.add_scalar("policy/frac_sell", action_counts["sell"] / total_actions, step)
+            writer.add_scalar(
+                "policy/frac_hold",
+                action_counts["hold"] / total_actions,
+                step,
+            )
+            writer.add_scalar(
+                "policy/frac_buy",
+                action_counts["buy"] / total_actions,
+                step,
+            )
+            writer.add_scalar(
+                "policy/frac_sell",
+                action_counts["sell"] / total_actions,
+                step,
+            )
 
             if trades > 0:
                 writer.add_scalar("trades/win_rate", wins / trades, step)
-                writer.add_scalar("trades/avg_pnl_pips", sum_pnl_pips / trades, step)
-            writer.add_scalar("risk/max_drawdown", float(info.get("max_drawdown", 0.0)), step)
+                writer.add_scalar(
+                    "trades/avg_pnl_pips", sum_pnl_pips / trades, step
+                )
+
+            writer.add_scalar(
+                "risk/max_drawdown",
+                float(info.get("max_drawdown", 0.0)),
+                step,
+            )
 
         # --------------- Internal eval ---------------
         if step % eval_every == 0 and len(rb) >= start_training:
@@ -339,19 +444,25 @@ def train(steps=1_000_000,
             writer.add_scalar("eval/avg_return", avg_ret, step)
             writer.add_scalar("eval/avg_length", avg_len, step)
             print("-" * 70)
-            print(f"[EVAL] step={step:,} avg_return={avg_ret:.3f} avg_len={avg_len:.1f}")
+            print(
+                f"[EVAL] step={step:,} "
+                f"avg_return={avg_ret:.3f} avg_len={avg_len:.1f}"
+            )
             if avg_ret > getattr(train, "_best_eval", -1e9):
                 train._best_eval = avg_ret
-                torch.save(online.state_dict(), "dqn_best.pt")
-                print(f"[CHECKPOINT] New best model -> dqn_best.pt")
-            snap_name = f"dqn_step_{step}.pt"
+                torch.save(online.state_dict(), "models/dqn_best.pt")
+                print("[CHECKPOINT] New best model -> models/dqn_best.pt")
+            snap_name = f"models/dqn_step_{step}.pt"
             torch.save(online.state_dict(), snap_name)
             print(f"[CHECKPOINT] Snapshot -> {snap_name}")
             print("-" * 70)
 
-    torch.save(online.state_dict(), "dqn_final.pt")
+    torch.save(online.state_dict(), "models/dqn_final.pt")
     print("=" * 70)
-    print("Training finished. Saved: dqn_best.pt (best eval), dqn_final.pt (final).")
+    print(
+        "Training finished. "
+        "Saved: models/dqn_best.pt (best eval), models/dqn_final.pt (final)."
+    )
 
 
 # ----------------- Evaluation helper used during training -----------------

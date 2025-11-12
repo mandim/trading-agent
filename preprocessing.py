@@ -182,4 +182,4 @@ def preprocess(
 
 if __name__ == "__main__":
     # Example:
-    preprocess("data/EURUSD_Daily.csv", "data/EURUSD_Ticks.csv", "cache_fx_EURUSD_D1")
+    preprocess("data/EURUSD_Daily_Pre_Trained.csv", "data/EURUSD_Ticks_Pre_Trained.csv", "cache_fx_EURUSD_D1_Pre_Trained")

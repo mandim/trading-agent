@@ -217,8 +217,8 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Cached folder
-cache_fx_EURUSD_D1/
-
+cache_*
+eval*
 runs/
-
-*.pt
+data/
+test/

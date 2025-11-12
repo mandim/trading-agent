@@ -11,7 +11,7 @@ except Exception:
 
 class TradingEnv(gym.Env):
     """
-    Merged DQN-ready trading environment.
+    Merged DQN-ready trading environment with broker costs.
 
     Key features:
       - Gymnasium API:
@@ -27,6 +27,12 @@ class TradingEnv(gym.Env):
       - Reward modes:
             "risk" : profit normalized by risk_per_trade_usd (or 1R) minus DD increment penalty
             "pnl"  : profit in USD normalized by risk_per_trade_usd minus DD increment penalty
+      - Broker cost model:
+            * Spread (optional, via include_spread_cost)
+            * Commission (per-lot per-side, account-type aware)
+            * Swaps (pips/day for long & short)
+            * Slippage (pips on open/close)
+            * Other fixed per-trade costs
       - Detailed info dict for logging & debugging
       - Optional ZeroMQ server integration
     """
@@ -49,6 +55,18 @@ class TradingEnv(gym.Env):
         reset_balance_each_episode: bool = True,
         include_spread_cost: bool = False,
         exchange_rate: float = 1.0,   # 1.0 for USD-quoted symbols like EURUSD
+
+        # Broker cost config
+        account_type: str = "standard",        # "raw" or "standard"
+        commission_per_lot_per_side_usd: float | None = None,
+        enable_commission: bool = True,
+        enable_swaps=False,
+        swap_long_pips_per_day=0.0,
+        swap_short_pips_per_day=0.0,
+        slippage_pips_open: float = 0.0,
+        slippage_pips_close: float = 0.0,
+        slippage_mode: str = "normal",   # "fixed", "uniform", "normal"
+        other_fixed_cost_per_trade_usd: float = 0.0,
 
         # Risk & penalties
         dd_penalty_lambda: float = 1.0,
@@ -76,7 +94,7 @@ class TradingEnv(gym.Env):
     ):
         super().__init__()
 
-        # Paths (kept for compatibility / future use)
+        # Paths
         self.candles_file = candles_file
         self.tick_file = tick_file
         self.cache_dir = cache_dir
@@ -90,6 +108,24 @@ class TradingEnv(gym.Env):
         self.reset_balance_each_episode = bool(reset_balance_each_episode)
         self.include_spread_cost = bool(include_spread_cost)
         self.exchange_rate = float(exchange_rate)
+
+        # Broker cost config
+        self.account_type = account_type.lower()
+        if commission_per_lot_per_side_usd is None:
+            # FP Markets-like defaults:
+            # Raw: ~$3 per lot per side; Standard: 0 (in spread)
+            self.commission_per_lot_per_side_usd = 3.0 if self.account_type == "raw" else 0.0
+        else:
+            self.commission_per_lot_per_side_usd = float(commission_per_lot_per_side_usd)
+
+        self.enable_commission = bool(enable_commission)
+        self.enable_swaps = bool(enable_swaps)
+        self.swap_long_pips_per_day = float(swap_long_pips_per_day)
+        self.swap_short_pips_per_day = float(swap_short_pips_per_day)
+        self.slippage_pips_open = float(slippage_pips_open)
+        self.slippage_pips_close = float(slippage_pips_close)
+        self.slippage_mode = slippage_mode
+        self.other_fixed_cost_per_trade_usd = float(other_fixed_cost_per_trade_usd)
 
         # Risk & penalties
         self.dd_penalty_lambda = float(dd_penalty_lambda)
@@ -133,6 +169,11 @@ class TradingEnv(gym.Env):
         self.steps = 0
         self.t = 0
         self.current_tick_row = 0
+
+        # Cost trackers
+        self.cumulative_commission = 0.0
+        self.cumulative_swap = 0.0
+        self.cumulative_other_costs = 0.0
 
         # Normalization anchors (set in reset)
         self.ask_mean = self.ask_std = None
@@ -194,7 +235,6 @@ class TradingEnv(gym.Env):
         # Balance handling
         if self.reset_balance_each_episode or not hasattr(self, "balance"):
             self.balance = self.start_balance
-        # else: keep running balance across episodes
 
         # Reset state
         self.equity = float(self.balance)
@@ -203,6 +243,11 @@ class TradingEnv(gym.Env):
         self.terminated = False
         self.truncated = False
         self.steps = 0
+
+        # Reset cost trackers
+        self.cumulative_commission = 0.0
+        self.cumulative_swap = 0.0
+        self.cumulative_other_costs = 0.0
 
         # Choose starting tick with warmup + train/eval split
         min_bar = self.window_len - 1
@@ -213,16 +258,13 @@ class TradingEnv(gym.Env):
         split_tick = int(self.n_ticks * self.train_fraction)
 
         if self.eval_mode:
-            # Start in unseen (evaluation) region
             start_low = max(base, split_tick)
             start_high = max(start_low + 1, self.n_ticks - 1)
         else:
-            # Start in training region
             start_low = base
             start_high = max(start_low + 1, max(base + 1, split_tick))
 
         if start_low >= start_high:
-            # Fallback: just use base
             self.t = base
         else:
             self.t = int(self._rng.integers(low=start_low, high=start_high, endpoint=False))
@@ -299,6 +341,16 @@ class TradingEnv(gym.Env):
         entry_idx = self.t
         entry_ask = float(self.tick_ask[entry_idx])
         entry_bid = float(self.tick_bid[entry_idx])
+
+        # Apply opening slippage (stochastic, always worse)
+        if self.slippage_pips_open > 0.0:
+            slip_open_pips = self._sample_slippage(self.slippage_pips_open)
+            slip_open = slip_open_pips * self.pip_decimal
+            if act == "BUY":
+                entry_ask += slip_open      # pay more to buy
+            else:  # SELL
+                entry_bid -= slip_open      # receive less to sell
+
         spread_once_pips = max(0.0, (entry_ask - entry_bid) / self.pip_decimal)
 
         tp_value = sl_value = None
@@ -319,6 +371,7 @@ class TradingEnv(gym.Env):
                     is_profitable = False
                     break
             close_px = float(self.tick_bid[k])
+            is_long = True
         else:  # SELL
             tp_value = entry_bid - self.tp_pips * self.pip_decimal
             sl_value = entry_ask + self.sl_pips * self.pip_decimal
@@ -333,6 +386,7 @@ class TradingEnv(gym.Env):
                     is_profitable = False
                     break
             close_px = float(self.tick_ask[k])
+            is_long = False
 
         # Move time cursor to close tick
         self.t = k
@@ -344,19 +398,42 @@ class TradingEnv(gym.Env):
             if self.t >= self.n_ticks - 1:
                 self.terminated = True
 
-        # Fixed ±TP/SL pips for PnL, then apply spread once if desired
+        # Apply closing slippage (stochastic, always worse)
+        if self.slippage_pips_close > 0.0:
+            slip_close_pips = self._sample_slippage(self.slippage_pips_close)
+            slip_close = slip_close_pips * self.pip_decimal
+            if act == "BUY":
+                close_px -= slip_close    # sell lower on close
+            else:  # SELL
+                close_px += slip_close    # buy higher on close
+
+        # Fixed ±TP/SL pips for base PnL, then optional spread cost
         base_pips = self.tp_pips if is_profitable else -self.sl_pips
         pnl_pips = float(base_pips)
         if self.include_spread_cost and spread_once_pips > 0.0:
             pnl_pips -= spread_once_pips
 
         pip_value = self._pip_value_usd()
-        profit_usd = float(pnl_pips * pip_value)
-
+        gross_profit_usd = float(pnl_pips * pip_value)
         trade_duration_ticks = int(self.t - entry_idx)
 
+        # ----------------- Swaps (approx days held via bar_times) -----------------
+        swap_usd = self._compute_swap_usd(is_long, entry_idx, self.t)
+
+        # ----------------- Commissions & other trade costs -----------------
+        commission_usd = self._commission_usd(round_turn=True)
+        other_cost_usd = float(self.other_fixed_cost_per_trade_usd)
+
+        # ----------------- Net PnL after all costs -----------------
+        net_profit_usd = gross_profit_usd + swap_usd - commission_usd - other_cost_usd
+
+        # Track cost components
+        self.cumulative_commission += commission_usd
+        self.cumulative_swap += swap_usd
+        self.cumulative_other_costs += other_cost_usd
+
         # ----------------- Update account & drawdown -----------------
-        next_balance = self.balance + profit_usd
+        next_balance = self.balance + net_profit_usd
 
         if next_balance <= 0.0:
             self.balance = 0.0
@@ -383,9 +460,9 @@ class TradingEnv(gym.Env):
             self.terminated = True
             self.truncated = True
 
-        # ----------------- Reward computation -----------------
+        # ----------------- Reward computation (based on NET profit) -----------------
         reward = self._calculate_reward(
-            profit_usd=profit_usd,
+            profit_usd=net_profit_usd,
             new_dd_increment=new_dd_increment,
         )
 
@@ -397,7 +474,7 @@ class TradingEnv(gym.Env):
 
         # 1R reference for logging
         one_R_usd = max(1e-8, self._pip_value_usd() * self.sl_pips)
-        profit_R = float(profit_usd / one_R_usd)
+        profit_R = float(net_profit_usd / one_R_usd)
 
         info = {
             "action": act,
@@ -412,9 +489,20 @@ class TradingEnv(gym.Env):
             "new_dd_increment": float(new_dd_increment),
             "is_profitable": bool(is_profitable),
             "last_reward": float(reward),
-            "profit": float(profit_usd),
+
+            # PnL components
+            "profit_gross_usd": float(gross_profit_usd),
+            "profit_net_usd": float(net_profit_usd),
+            "profit": float(net_profit_usd),  # backwards compatibility: now NET
             "profit_R": float(profit_R),
             "pnl_pips": float(pnl_pips),
+            "swap_usd": float(swap_usd),
+            "commission_usd": float(commission_usd),
+            "other_cost_usd": float(other_cost_usd),
+            "cumulative_commission": float(self.cumulative_commission),
+            "cumulative_swap": float(self.cumulative_swap),
+            "cumulative_other_costs": float(self.cumulative_other_costs),
+
             "close_price": float(close_px),
             "trade_duration_ticks": trade_duration_ticks,
             "eof": bool(self.t >= self.n_ticks - 1),
@@ -427,6 +515,31 @@ class TradingEnv(gym.Env):
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------
+    def _sample_slippage(self, base_pips: float) -> float:
+        """
+        Returns slippage in *pips* (>=0 for our worse-price convention).
+        base_pips is the configured slippage_pips_*.
+        """
+        if base_pips <= 0:
+            return 0.0
+
+        mode = (self.slippage_mode or "fixed").lower()
+
+        if mode == "fixed":
+            return base_pips
+
+        if mode == "uniform":
+            # Uniform [0, base_pips]
+            return float(self._rng.uniform(0.0, base_pips))
+
+        if mode == "normal":
+            # Half-normal around 0 with sigma = base_pips
+            val = abs(self._rng.normal(loc=0.0, scale=base_pips))
+            return float(val)
+
+        # Fallback
+        return base_pips
+
     def _pip_value_usd(self) -> float:
         """
         Value of 1 pip (pip_decimal) in USD for the configured lot size.
@@ -434,10 +547,59 @@ class TradingEnv(gym.Env):
         """
         return ((self.lot * 100000.0) * self.pip_decimal) / max(1e-12, self.exchange_rate)
 
+    def _commission_usd(self, round_turn: bool = False) -> float:
+        """
+        Commission in USD for this trade (fixed lot size).
+        If round_turn=True, charges both open and close.
+        """
+        if not self.enable_commission or self.commission_per_lot_per_side_usd <= 0.0:
+            return 0.0
+        sides = 2 if round_turn else 1
+        return float(self.lot * self.commission_per_lot_per_side_usd * sides)
+
+    def _compute_swap_usd(self, is_long: bool, entry_idx: int, exit_idx: int) -> float:
+        """
+        Approximate swap based on bar_times and tick_to_bar.
+        swap_*_pips_per_day are per 1 lot; scaled by lot size via _pip_value_usd().
+        """
+        if not self.enable_swaps or exit_idx <= entry_idx:
+            return 0.0
+        if not hasattr(self, "bar_times") or self.bar_times is None:
+            return 0.0
+
+        entry_bar = int(self.tick_to_bar[entry_idx])
+        exit_bar = int(self.tick_to_bar[exit_idx])
+        if exit_bar <= entry_bar:
+            return 0.0
+
+        t0 = self.bar_times[entry_bar]
+        t1 = self.bar_times[exit_bar]
+
+        # Support datetime64 or numeric seconds
+        try:
+            if np.issubdtype(self.bar_times.dtype, np.datetime64):
+                days_held = float((t1 - t0) / np.timedelta64(1, "D"))
+            else:
+                # assume seconds
+                days_held = float(t1 - t0) / (24.0 * 60.0 * 60.0)
+        except Exception:
+            days_held = float(exit_bar - entry_bar)
+
+        days_held = max(0.0, days_held)
+        if days_held <= 0.0:
+            return 0.0
+
+        rate = self.swap_long_pips_per_day if is_long else self.swap_short_pips_per_day
+        if rate == 0.0:
+            return 0.0
+
+        # rate is pips/day per 1 lot; _pip_value_usd() already includes lot size
+        return float(rate * self._pip_value_usd() * days_held)
+
     def _equity_mtm(self) -> float:
         """
-        Mark-to-market equity. In this per-trade env we are flat after each step,
-        so equity == balance, but kept as separate hook.
+        Mark-to-market equity.
+        In this per-trade env we are flat after each step, so equity == balance.
         """
         return float(self.balance)
 
@@ -479,15 +641,12 @@ class TradingEnv(gym.Env):
 
     def _calculate_reward(self, profit_usd: float, new_dd_increment: float) -> float:
         """
-        Unified reward:
-          - If reward_mode == "risk":
-                reward = (profit_usd / denom) - λ * ΔDD
-                denom = risk_per_trade_usd (if >0) else 1R (pip_value * sl_pips)
-          - If reward_mode == "pnl":
-                reward = (profit_usd / denom) - λ * ΔDD
-                denom = risk_per_trade_usd (if >0) else 1.0
-          - Else:
-                fallback to 1R-based normalization.
+        Unified reward using NET profit_usd:
+          - "risk": reward = (profit_usd / denom) - λ * ΔDD
+                    denom = risk_per_trade_usd (if >0) else 1R
+          - "pnl" : reward = (profit_usd / denom) - λ * ΔDD
+                    denom = risk_per_trade_usd (if >0) else 1.0
+          - else : fallback to 1R-based normalization.
         """
         pip_value = self._pip_value_usd()
         one_R_usd = max(1e-8, pip_value * self.sl_pips)
