@@ -76,7 +76,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cache_dir", default="cache_fx_EURUSD_D1_2020_2025")
     parser.add_argument("--model_path", default="models/dqn_best.pt")
-    parser.add_argument("--bind", default="tcp://*:6000")
+    parser.add_argument("--bind", default="tcp://127.0.0.1:6000")
     parser.add_argument("--window_len", type=int, default=32)
     parser.add_argument("--normalize_bars", type=int, default=1)
     parser.add_argument("--price_norm_lookback", type=int, default=20000)
