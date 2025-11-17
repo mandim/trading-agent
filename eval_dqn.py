@@ -286,7 +286,7 @@ def run_episode(env, net, device, tb_writer=None, global_trade_step=0):
 # ---- Main --------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", type=str, default="dqn_best.pt")
+    ap.add_argument("--model", type=str, default="models/dqn_best.pt")
     ap.add_argument("--episodes", type=int, default=10)
     ap.add_argument("--seed", type=int, default=999)
     ap.add_argument("--cachedir", type=str, default="cache_fx_EURUSD_D1")

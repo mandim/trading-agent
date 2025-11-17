@@ -102,15 +102,30 @@ def main():
     model = None
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.set_grad_enabled(False)
+    
+    action_hist = {0: 0, 1: 0, 2: 0}
 
     while True:
-        msg = sock.recv()
+        
+        try:
+            msg = sock.recv()
+        except KeyboardInterrupt:
+            print("[serve] KeyboardInterrupt, shutting down...")
+            break
+        
         try:
             req = json.loads(msg.decode("utf-8"))
         except Exception:
             sock.send_json({"ok": False, "error": "invalid_json"})
             continue
 
+        # ---- graceful shutdown command ----
+        if req.get("cmd") == "shutdown":
+            sock.send_json({"ok": True, "reply": "shutting_down"})
+            print("[serve] Received shutdown command from client.")
+            break
+        # -----------------------------------
+        
         # Protocol
         if req.get("cmd") == "reset":
             price_norms = {
@@ -156,6 +171,14 @@ def main():
 
         q = model(torch.from_numpy(obs).float().unsqueeze(0).to(device))
         a = int(q.argmax(dim=1).item())
+        
+        action_hist[a] += 1
+        print("[serve] action_hist so far:", action_hist)
+            
+        # DEBUG: print every Nth step only if you want
+        # (for now it’s okay to always print during a short test)
+        print("[serve] a =", a, "q =", q.detach().cpu().numpy().tolist())
+        
         out = {
             "ok": True,
             "a": a,
@@ -163,6 +186,10 @@ def main():
             "q": q.squeeze(0).tolist(),
         }
         sock.send_json(out)
+        
+    sock.close(0)
+    ctx.term()
+    print("[serve] Closed socket and context. Bye.")
 
 if __name__ == "__main__":
     main()
