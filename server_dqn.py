@@ -1,5 +1,111 @@
-import os, json, time, argparse, numpy as np, torch, torch.nn as nn
+import os, json, argparse, numpy as np, torch, torch.nn as nn
 import zmq
+
+# ---------- Indicator helpers (mirror preprocessing.py) ----------
+
+def ema_np(arr, alpha: float) -> np.ndarray:
+    """
+    Same logic as preprocessing.ema (Numba version), but pure NumPy.
+    s_0 = x_0, then s_t = alpha * x_t + (1 - alpha) * s_{t-1}.
+    """
+    arr = np.asarray(arr, dtype=np.float32)
+    out = np.empty_like(arr, dtype=np.float32)
+    s = 0.0
+    started = False
+    for i in range(arr.size):
+        x = float(arr[i])
+        if not started:
+            s = x
+            started = True
+        else:
+            s = alpha * x + (1.0 - alpha) * s
+        out[i] = s
+    return out
+
+
+def rsi_np(prices: np.ndarray, window: int = 14) -> np.ndarray:
+    """
+    Same as preprocessing.rsi: build gains/losses and apply EMA with alpha = 1/window.
+    """
+    prices = np.asarray(prices, dtype=np.float32)
+    n = prices.size
+    gains = np.zeros(n, dtype=np.float32)
+    losses = np.zeros(n, dtype=np.float32)
+
+    for i in range(1, n):
+        d = prices[i] - prices[i - 1]
+        if d >= 0:
+            gains[i] = d
+        else:
+            losses[i] = -d
+
+    alpha = 1.0 / float(window)
+    avg_gain = ema_np(gains, alpha)
+    avg_loss = ema_np(losses, alpha)
+
+    rs = avg_gain / (avg_loss + 1e-12)
+    out = 100.0 - (100.0 / (1.0 + rs))
+    return out.astype(np.float32)
+
+
+def atr_np(high: np.ndarray, low: np.ndarray, close: np.ndarray, window: int = 14) -> np.ndarray:
+    """
+    Same as preprocessing.atr: true range series then EMA with alpha = 1/window.
+    """
+    high = np.asarray(high, dtype=np.float32)
+    low = np.asarray(low, dtype=np.float32)
+    close = np.asarray(close, dtype=np.float32)
+    n = close.size
+
+    tr = np.empty(n, dtype=np.float32)
+    tr[0] = high[0] - low[0]
+    for i in range(1, n):
+        hl = high[i] - low[i]
+        hc = abs(high[i] - close[i - 1])
+        lc = abs(low[i] - close[i - 1])
+        tr[i] = max(hl, hc, lc)
+
+    alpha = 1.0 / float(window)
+    return ema_np(tr, alpha).astype(np.float32)
+
+
+def compute_bar_features_from_raw(
+    bars_raw: np.ndarray,
+    ema_fast: int = 12,
+    ema_slow: int = 26,
+    rsi_w: int = 14,
+    atr_w: int = 14,
+) -> np.ndarray:
+    """
+    Recreate EXACT bar_features layout used in preprocessing.py:
+
+      bars_features = [close, ema_f, ema_s, macd, macd_sig, rsi, atr]
+
+    bars_raw is expected shape (L, >=4) with columns:
+      0=Open, 1=High, 2=Low, 3=Close, [4=Volume (ignored for indicators)]
+    """
+    bars_raw = np.asarray(bars_raw, dtype=np.float32)
+    if bars_raw.ndim != 2 or bars_raw.shape[1] < 4:
+        raise ValueError(f"bars_raw must be 2D with at least 4 columns (O,H,L,C), got {bars_raw.shape}")
+
+    o = bars_raw[:, 0]
+    h = bars_raw[:, 1]
+    l = bars_raw[:, 2]
+    c = bars_raw[:, 3]
+
+    alpha_f = 2.0 / (ema_fast + 1.0)
+    alpha_s = 2.0 / (ema_slow + 1.0)
+
+    ema_f = ema_np(c, alpha_f)
+    ema_s = ema_np(c, alpha_s)
+    macd = (ema_f - ema_s).astype(np.float32)
+    macd_sig = ema_np(macd, 2.0 / (9.0 + 1.0))
+    rsi_vals = rsi_np(c, rsi_w)
+    atr_vals = atr_np(h, l, c, atr_w)
+
+    bars_features = np.column_stack([c, ema_f, ema_s, macd, macd_sig, rsi_vals, atr_vals]).astype(np.float32)
+    return bars_features
+
 
 # ==== Match the training net (from train_dqn.py) ====
 class QNet(nn.Module):
@@ -74,7 +180,7 @@ def build_obs(bar_window: np.ndarray,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache_dir", default="cache_fx_EURUSD_D1_2020_2025")
+    parser.add_argument("--cache_dir", default="cache_fx_EURUSD_D1")
     parser.add_argument("--model_path", default="models/dqn_best.pt")
     parser.add_argument("--bind", default="tcp://127.0.0.1:6000")
     parser.add_argument("--window_len", type=int, default=32)
@@ -126,7 +232,7 @@ def main():
             break
         # -----------------------------------
         
-        # Protocol
+                # Protocol
         if req.get("cmd") == "reset":
             price_norms = {
                 "ask": RollingNorm(args.price_norm_lookback),
@@ -140,16 +246,39 @@ def main():
             sock.send_json({"ok": False, "error": "unknown_cmd"})
             continue
 
-        # Required fields
-        bar_window = req.get("bar_window")  # list[list[float]] shape (L, n_feats)
+        # -------- Required fields --------
         ask = req.get("ask")
         bid = req.get("bid")
 
-        if bar_window is None or ask is None or bid is None:
-            sock.send_json({"ok": False, "error": "missing_fields"})
+        # New protocol: prefer raw OHLCV if present
+        bar_window_raw = req.get("bar_window_raw")  # list[list[float]] shape (L, 4/5)
+        bar_window = req.get("bar_window")          # legacy: already-computed features
+
+        if ask is None or bid is None:
+            sock.send_json({"ok": False, "error": "missing_fields_ask_bid"})
             continue
 
-        bar_window = np.asarray(bar_window, dtype=np.float32)
+        # Build feature window
+        if bar_window_raw is not None:
+            bars_raw = np.asarray(bar_window_raw, dtype=np.float32)
+            if bars_raw.ndim != 2 or bars_raw.shape[0] != args.window_len:
+                sock.send_json({"ok": False, "error": "bad_bar_window_raw_shape"})
+                continue
+            try:
+                bar_window = compute_bar_features_from_raw(bars_raw)
+            except Exception as e:
+                sock.send_json({"ok": False, "error": f"feature_computation_failed: {str(e)}"})
+                continue
+
+        elif bar_window is not None:
+            # legacy path: EA sends features directly
+            bar_window = np.asarray(bar_window, dtype=np.float32)
+
+        else:
+            sock.send_json({"ok": False, "error": "missing_bar_window_or_raw"})
+            continue
+
+        # Sanity check final feature window
         if bar_window.ndim != 2 or bar_window.shape[0] != args.window_len:
             sock.send_json({"ok": False, "error": "bad_bar_window_shape"})
             continue
