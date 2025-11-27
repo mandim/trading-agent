@@ -142,6 +142,78 @@ class RollingNorm:
         if m is None or s is None or s == 0.0:
             return float(x)
         return float((x - m) / s)
+    
+class StaticPriceNorms:
+    """
+    Episode-style price normalization:
+      - fit once from historical ask/bid arrays
+      - then keep mean/std fixed for all ticks in the episode
+    """
+    def __init__(self):
+        self.ask_mean = None
+        self.ask_std = None
+        self.bid_mean = None
+        self.bid_std = None
+        self.spread_mean = None
+        self.spread_std = None
+
+    def fit_from_arrays(self, ask_arr, bid_arr):
+        ask_arr = np.asarray(ask_arr, dtype=np.float32)
+        bid_arr = np.asarray(bid_arr, dtype=np.float32)
+        spread_arr = ask_arr - bid_arr
+
+        self.ask_mean = float(ask_arr.mean())
+        self.ask_std  = float(ask_arr.std() + 1e-8)
+
+        self.bid_mean = float(bid_arr.mean())
+        self.bid_std  = float(bid_arr.std() + 1e-8)
+
+        self.spread_mean = float(spread_arr.mean())
+        self.spread_std  = float(spread_arr.std() + 1e-8)
+
+    def normalize(self, ask, bid):
+        spread = ask - bid
+
+        def nz(x, m, s):
+            if m is None or s is None or s == 0.0:
+                return float(x)
+            return float((x - m) / (s + 1e-8))
+
+        a = nz(ask, self.ask_mean, self.ask_std)
+        b = nz(bid, self.bid_mean, self.bid_std)
+        s = nz(spread, self.spread_mean, self.spread_std)
+        return a, b, s
+
+
+def fit_price_norms_from_cache(cache_dir: str,
+                               norms: StaticPriceNorms,
+                               lookback: int = 20000):
+    """
+    Fit StaticPriceNorms from cached tick_ask/tick_bid.
+
+    This approximates the env behavior which, on reset, fits mean/std
+    from a large window of historical ticks behind the episode start.
+    Here we just use the last `lookback` ticks from cache.
+    """
+    try:
+        tick_ask = np.load(os.path.join(cache_dir, "tick_ask.npy"), mmap_mode="r")
+        tick_bid = np.load(os.path.join(cache_dir, "tick_bid.npy"), mmap_mode="r")
+    except Exception as e:
+        print(f"[serve] Could not load ticks for price norms: {e}")
+        return
+
+    n = int(tick_ask.shape[0])
+    if n == 0:
+        print("[serve] No ticks in cache for price norms.")
+        return
+
+    start = max(0, n - int(lookback))
+    ask_slice = tick_ask[start:].astype(np.float32)
+    bid_slice = tick_bid[start:].astype(np.float32)
+
+    norms.fit_from_arrays(ask_slice, bid_slice)
+    print(f"[serve] Price norms fitted from cache with {ask_slice.shape[0]} ticks")
+
 
 def load_bars_scaler(cache_dir: str, normalize_bars: bool):
     mean_p = os.path.join(cache_dir, "bars_mean.npy")
@@ -158,24 +230,28 @@ def build_obs(bar_window: np.ndarray,
               price_norms):
     """
     bar_window: shape (L, n_feats), oldest->newest
-    price_norms: dict of RollingNorm for 'ask','bid','spread'
+    price_norms: dict of RollingNorm instances for ask, bid, spread
     """
     # normalize bar features if scalers exist (train split stats)
     if bars_mean is not None and bars_std is not None:
         bar_window = (bar_window - bars_mean) / (bars_std + 1e-8)
 
+    ask = float(ask)
+    bid = float(bid)
     spread = ask - bid
-    # update rolling stats then normalize
+
+    # update rolling buffers
     price_norms["ask"].update(ask)
     price_norms["bid"].update(bid)
     price_norms["spread"].update(spread)
 
+    # normalize using rolling stats
     a = price_norms["ask"].normalize(ask)
     b = price_norms["bid"].normalize(bid)
     s = price_norms["spread"].normalize(spread)
 
     obs = np.hstack([bar_window.ravel(), np.array([a, b, s], dtype=np.float32)]).astype(np.float32)
-    obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)  # match env safeguards
+    obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
     return obs
 
 def main():
@@ -203,6 +279,9 @@ def main():
         "bid": RollingNorm(args.price_norm_lookback),
         "spread": RollingNorm(args.price_norm_lookback),
     }
+    # Price normalizers (static, episode-style like env reset)
+    # price_norms = StaticPriceNorms()
+    # fit_price_norms_from_cache(args.cache_dir, price_norms, args.price_norm_lookback)
 
     # Lazy model init after we know obs_dim
     model = None
@@ -232,7 +311,15 @@ def main():
             break
         # -----------------------------------
         
-                # Protocol
+        # Protocol
+        # if req.get("cmd") == "reset":
+        #     price_norms = {
+        #         "ask": RollingNorm(args.price_norm_lookback),
+        #         "bid": RollingNorm(args.price_norm_lookback),
+        #         "spread": RollingNorm(args.price_norm_lookback),
+        #     }
+        #     sock.send_json({"ok": True, "reply": "reset_done"})
+        #     continue
         if req.get("cmd") == "reset":
             price_norms = {
                 "ask": RollingNorm(args.price_norm_lookback),

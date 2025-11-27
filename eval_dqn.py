@@ -27,7 +27,9 @@ def make_env(
     seed=999,
     reset_balance_each_episode=False,
     max_steps_per_episode=5000,
-    cache_dir="cache_fx_EURUSD_D1_2020_2025"
+    cache_dir="cache_fx_EURUSD_D1",
+    risk_percent=1.0,
+    use_percent_risk=True,
 ):
     """
     Mirror the training environment, but with eval_mode=True.
@@ -49,18 +51,18 @@ def make_env(
         exchange_rate=1.0,
 
         # broker cost model (must match training config)
-        account_type="raw",              # "raw" -> ~3$ per lot per side, if not overridden
-        enable_commission=True,
+        account_type="standard",              # "raw" -> ~3$ per lot per side, if not overridden
+        enable_commission=False,
         # commission_per_lot_per_side_usd=3.0,  # uncomment to force exact
 
         enable_swaps=True,                 # set True + rates if you want swaps in training
-        swap_long_pips_per_day=-0.971,  # EURUSD long
-        swap_short_pips_per_day=0.45,   # EURUSD short
+        swap_long_pips_per_day=-1.3,   # match FXT
+        swap_short_pips_per_day=0.42,  # match FXT
 
         # conservative slippage model; tune per your tests
-        slippage_mode="uniform",       # or "fixed" / "normal"
-        slippage_pips_open=0.2,       # typical max / std in pips
-        slippage_pips_close=0.2,
+        slippage_mode="fixed",       # or "fixed" / "normal"
+        slippage_pips_open=1.0,       # typical max / std in pips
+        slippage_pips_close=1.0,
 
         other_fixed_cost_per_trade_usd=0.0,
 
@@ -68,12 +70,14 @@ def make_env(
         dd_penalty_lambda=1.0,
         max_dd_stop=0.30,
         reward_mode="risk",
-        risk_per_trade_usd=1000.0,
+        risk_per_trade_usd=0.0,      # not used when use_percent_risk=True
+        risk_percent=risk_percent,   # NEW
+        use_percent_risk=use_percent_risk,  # NEW
 
         # episodes / split
         max_steps_per_episode=max_steps_per_episode,
-        train_fraction=0.7,
-        eval_mode=True,
+        train_fraction=0.0,
+        eval_mode=False,
 
         # observations & normalization
         window_len=32,
@@ -287,7 +291,7 @@ def run_episode(env, net, device, tb_writer=None, global_trade_step=0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default="models/dqn_best.pt")
-    ap.add_argument("--episodes", type=int, default=10)
+    ap.add_argument("--episodes", type=int, default=1)
     ap.add_argument("--seed", type=int, default=999)
     ap.add_argument("--cachedir", type=str, default="cache_fx_EURUSD_D1")
     ap.add_argument(
@@ -303,7 +307,10 @@ def main():
         action="store_true",
         help="Reset balance each episode (default: keep running equity).",
     )
-    ap.add_argument("--max_steps_per_episode", type=int, default=5000)
+    ap.add_argument("--max_steps_per_episode", type=int, default=None)
+    ap.add_argument("--risk_percent", type=float, default=1.0)
+    ap.add_argument("--use_percent_risk", action="store_true")
+    
     args = ap.parse_args()
 
     device = torch.device(args.device)

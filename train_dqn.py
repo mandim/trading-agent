@@ -59,54 +59,60 @@ def make_env(seed=123, eval_mode=False, reset_balance_each_episode=True):
     """
     Single source of truth for env config (train & eval).
 
-    Configured to emulate FP Markets RAW account:
-      - Realistic TP/SL R-structure
-      - Spread cost applied once per trade
-      - Commission per lot per side
-      - Swaps / slippage configurable
+    Training:
+      - eval_mode=False
+      - reset_balance_each_episode=True (start from 100k each episode)
+    Internal eval:
+      - eval_mode=True
+      - reset_balance_each_episode=False (carry equity forward like MT4 if you want)
     """
     env = TradingEnv(
         pip_decimal=0.0001,
         candles_file="unused.csv",
         tick_file="unused.csv",
-        cache_dir="cache_fx_EURUSD_D1_2020_2025",
+        cache_dir="cache_fx_EURUSD_D1",   # <- same as eval_dqn.py / FXT cache
 
         # trading
         tp_pips=50.0,
         sl_pips=50.0,
-        lot=1.0,
+        lot=1.0,                          # base lot; overridden by percent-risk if enabled
         start_balance=100_000.0,
         reset_balance_each_episode=reset_balance_each_episode,
-        include_spread_cost=True,   # pay spread once per trade
+        include_spread_cost=True,
         exchange_rate=1.0,
 
-        # BROKER COST MODEL (FP Markets RAW-style)
-        account_type="raw",                 # "raw" -> default 3$ per lot per side
-        enable_commission=True,
-        # override if needed:
-        # commission_per_lot_per_side_usd=3.0,
+        # broker cost model (match MT4 / eval)
+        account_type="standard",
+        enable_commission=False,          # standard account -> costs in spread, no explicit commission
+        # commission_per_lot_per_side_usd=3.0,  # only for RAW accounts
 
-        enable_swaps=True,                 # set True + rates if you want swaps in training
-        swap_long_pips_per_day=-0.971,  # EURUSD long
-        swap_short_pips_per_day=0.45,   # EURUSD short
+        enable_swaps=True,
+        swap_long_pips_per_day=-1.3,
+        swap_short_pips_per_day=0.42,
 
-        # conservative slippage model; tune per your tests
-        slippage_mode="uniform",       # or "fixed" / "normal"
-        slippage_pips_open=0.2,       # typical max / std in pips
-        slippage_pips_close=0.2,
+        # slippage model (set to what you actually use in MT4)
+        slippage_mode="fixed",
+        slippage_pips_open=1.0,
+        slippage_pips_close=1.0,
 
         other_fixed_cost_per_trade_usd=0.0,
 
         # risk & reward
         dd_penalty_lambda=1.0,
         max_dd_stop=0.30,
-        reward_mode="risk",          # "risk" (R-based) or "pnl" (USD-based)
-        risk_per_trade_usd=1000.0,
+        reward_mode="risk",
+        reward_dense=True,       # <– enable
+
+        # Position sizing (percent of equity; env computes lot per trade)
+        risk_per_trade_usd=0.0,          # 0 -> use percent-based if enabled
+        risk_percent=1.0,                # 1% of equity per trade
+        use_percent_risk=True,
 
         # episodes / split
-        max_steps_per_episode=5000,
-        train_fraction=0.7,
-        eval_mode=eval_mode,
+        max_steps_per_episode=None,      # can keep; episode will end earlier if max_dd_stop hit
+        max_trade_ticks=2000,
+        train_fraction=0.7,              # first 70% of data for training, last 30% for internal eval
+        eval_mode=eval_mode,             # IMPORTANT: eval_mode=True for bar-open gating in eval()
 
         # observations & normalization
         window_len=32,
@@ -488,7 +494,7 @@ def evaluate(policy_net: nn.Module, episodes=5, device="cpu"):
 
 if __name__ == "__main__":
     train(
-        steps=300_000,
+        steps=2_000_000,
         batch_size=256,
         gamma=0.998,
         lr=1e-4,
@@ -496,8 +502,8 @@ if __name__ == "__main__":
         target_tau=0.005,
         eps_start=1.0,
         eps_end=0.05,
-        eps_decay_steps=150_000,
-        eval_every=50_000,
+        eps_decay_steps=800_000,
+        eval_every=200_000,
         logdir="runs/dqn",
         log_every_steps=5_000,
         print_episode_end=True,
