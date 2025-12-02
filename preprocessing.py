@@ -90,7 +90,7 @@ def preprocess(
     l = bars["Low"].to_numpy(np.float32)
     c = bars["Close"].to_numpy(np.float32)
 
-    # Indicators
+    # --- Indicators ---
     alpha_f = 2.0 / (ema_fast + 1)
     alpha_s = 2.0 / (ema_slow + 1)
     ema_f = ema(c, alpha_f).astype(np.float32)
@@ -100,10 +100,29 @@ def preprocess(
     _rsi = rsi(c, rsi_w).astype(np.float32)
     _atr = atr(h, l, c, atr_w).astype(np.float32)
 
-    # Bar-level feature matrix
-    bars_features = np.column_stack(
-        [c, ema_f, ema_s, macd, macd_sig, _rsi, _atr]
-    ).astype(np.float32)
+    # --- Multi-scale returns ---
+    ret_1 = np.concatenate([[0.0], np.diff(c) / c[:-1]]).astype(np.float32)
+    ret_5 = (c / np.roll(c, 5) - 1.0).astype(np.float32)
+    ret_20 = (c / np.roll(c, 20) - 1.0).astype(np.float32)
+    ret_5[:5] = 0.0
+    ret_20[:20] = 0.0
+
+    # --- Regime ---
+    above_ema_slow = (c > ema_s).astype(np.float32)
+    ema_dist = ((c - ema_s) / ema_s).astype(np.float32)
+    price_range = ((h - l) / c).astype(np.float32)
+
+    # --- Volatility ---
+    ret_std_20 = pd.Series(ret_1).rolling(20, min_periods=1).std().to_numpy(np.float32)
+    ret_std_50 = pd.Series(ret_1).rolling(50, min_periods=1).std().to_numpy(np.float32)
+
+    # --- Combine ---
+    bars_features = np.column_stack([
+        c, ema_f, ema_s, macd, macd_sig, _rsi, _atr,
+        ret_1, ret_5, ret_20,
+        above_ema_slow, ema_dist,
+        price_range, ret_std_20, ret_std_50,
+    ]).astype(np.float32)
 
     # --- Compute and save scaler for bar features (based on train split) ---
     n_bars = bars_features.shape[0]

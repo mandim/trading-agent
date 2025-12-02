@@ -1,4 +1,4 @@
-import os, math, random, collections, time, shutil, sys
+import os, random, collections, time, shutil
 import numpy as np
 import torch
 import torch.nn as nn
@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 
-# import the merged, cost-aware environment
 from trading_env_merged import TradingEnv
 
 
@@ -21,7 +20,7 @@ class QNet(nn.Module):
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        return self.fc3(x)  # Q-values for each action
+        return self.fc3(x)  # Q-values
 
 
 # ----------------- Replay Buffer -----------------
@@ -62,65 +61,56 @@ def make_env(seed=123, eval_mode=False, reset_balance_each_episode=True):
     Training:
       - eval_mode=False
       - reset_balance_each_episode=True (start from 100k each episode)
+
     Internal eval:
       - eval_mode=True
-      - reset_balance_each_episode=False (carry equity forward like MT4 if you want)
+      - reset_balance_each_episode=False (carry equity forward like MT4 if desired)
     """
     env = TradingEnv(
         pip_decimal=0.0001,
         candles_file="unused.csv",
         tick_file="unused.csv",
-        cache_dir="cache_fx_EURUSD_D1",   # <- same as eval_dqn.py / FXT cache
+        cache_dir="cache_fx_EURUSD_D1",
 
-        # trading
-        tp_pips=50.0,
-        sl_pips=50.0,
-        lot=1.0,                          # base lot; overridden by percent-risk if enabled
+        # Trading
+        tp_pips=100.0,
+        sl_pips=100.0,
+        lot=1.0,
         start_balance=100_000.0,
         reset_balance_each_episode=reset_balance_each_episode,
-        include_spread_cost=True,
         exchange_rate=1.0,
 
-        # broker cost model (match MT4 / eval)
-        account_type="standard",
-        enable_commission=False,          # standard account -> costs in spread, no explicit commission
-        # commission_per_lot_per_side_usd=3.0,  # only for RAW accounts
-
-        enable_swaps=True,
-        swap_long_pips_per_day=-1.3,
-        swap_short_pips_per_day=0.42,
-
-        # slippage model (set to what you actually use in MT4)
+        # Broker costs (kept off for training; spread comes from BID/ASK)
+        commission_per_lot_per_side_usd=0.0,
+        enable_commission=False,
+        enable_swaps=False,
+        swap_long_pips_per_day=0.0,
+        swap_short_pips_per_day=0.0,
+        slippage_pips_open=0.0,
+        slippage_pips_close=0.0,
         slippage_mode="fixed",
-        slippage_pips_open=1.0,
-        slippage_pips_close=1.0,
-
         other_fixed_cost_per_trade_usd=0.0,
 
-        # risk & reward
-        dd_penalty_lambda=1.0,
+        # Risk & penalties
+        dd_penalty_lambda=0.0,
         max_dd_stop=0.30,
-        reward_mode="risk",
-        reward_dense=True,       # <– enable
 
-        # Position sizing (percent of equity; env computes lot per trade)
-        risk_per_trade_usd=0.0,          # 0 -> use percent-based if enabled
-        risk_percent=1.0,                # 1% of equity per trade
-        use_percent_risk=True,
+        # Episodes / split
+        max_steps_per_episode=None if eval_mode else 10000,
+        train_fraction=0.7,
+        eval_mode=eval_mode,
 
-        # episodes / split
-        max_steps_per_episode=None,      # can keep; episode will end earlier if max_dd_stop hit
-        max_trade_ticks=2000,
-        train_fraction=0.7,              # first 70% of data for training, last 30% for internal eval
-        eval_mode=eval_mode,             # IMPORTANT: eval_mode=True for bar-open gating in eval()
+        # Reward scaling
+        reward_scale_usd=100.0,
 
-        # observations & normalization
+        # Obs / normalization
         window_len=32,
         normalize_prices=True,
         normalize_bars=True,
 
-        # runtime
+        # Runtime
         start_server=False,
+        bind_address="tcp://*:5555",
         seed=seed,
     )
     return env
@@ -152,13 +142,13 @@ def _make_tb_writer(base_dir: str, run_tag: str | None = None, clean: bool = Fal
 def train(
     steps=1_000_000,
     batch_size=256,
-    gamma=0.998,
-    lr=1e-4,
+    gamma=0.995,
+    lr=5e-5,
     start_training=10_000,
     target_tau=0.01,
     eps_start=1.0,
-    eps_end=0.1,
-    eps_decay_steps=300_000,
+    eps_end=0.05,
+    eps_decay_steps=500_000,
     eval_every=50_000,
     logdir="runs/dqn",
     log_every_steps=5_000,
@@ -166,7 +156,6 @@ def train(
     run_tag="DQN_fx",
     clean_logs=False,
 ):
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     writer, name = _make_tb_writer(logdir, run_tag=run_tag, clean=clean_logs)
@@ -184,7 +173,7 @@ def train(
     opt = torch.optim.Adam(online.parameters(), lr=lr)
     rb = Replay(cap=200_000)
 
-    # Session-level accumulators (using NET PnL from env)
+    # Session stats
     cum_profit_usd = 0.0
     cum_profit_R = 0.0
     cum_loss_usd = 0.0
@@ -192,7 +181,7 @@ def train(
     cum_trades = 0
     session_start_balance = getattr(env, "start_balance", 100000.0)
 
-    # Cost components (for monitoring broker friction)
+    # Cost stats
     cum_commission_usd = 0.0
     cum_swap_usd = 0.0
     cum_other_costs_usd = 0.0
@@ -250,14 +239,12 @@ def train(
         s2, r, terminated, truncated, info = env.step(a)
         done = bool(terminated or truncated)
 
-        # -------- Per-trade accounting (env already returns NET PnL) --------
+        # -------- Per-trade accounting (env returns NET PnL) --------
         if info.get("closed_trade", False):
-            # Net after costs:
             trade_pnl_usd = float(info.get("profit", 0.0))
             trade_R = float(info.get("profit_R", 0.0))
             pnl_pips = float(info.get("pnl_pips", 0.0))
 
-            # Cost breakdown from env (if available)
             commission_usd = float(info.get("commission_usd", 0.0))
             swap_usd = float(info.get("swap_usd", 0.0))
             other_cost_usd = float(info.get("other_cost_usd", 0.0))
@@ -266,12 +253,10 @@ def train(
             trades += 1
             sum_pnl_pips += pnl_pips
 
-            # Track costs
             cum_commission_usd += commission_usd
             cum_swap_usd += swap_usd
             cum_other_costs_usd += other_cost_usd
 
-            # Split wins / losses on NET PnL
             if trade_pnl_usd >= 0:
                 cum_profit_usd += trade_pnl_usd
             else:
@@ -288,11 +273,9 @@ def train(
             net_profit_usd = cum_profit_usd - cum_loss_usd
             net_profit_R = cum_profit_R - cum_loss_R
             session_equity = session_start_balance + net_profit_usd
-            profit_factor = (
-                (cum_profit_usd / cum_loss_usd) if cum_loss_usd > 0 else float("inf")
-            )
+            profit_factor = (cum_profit_usd / cum_loss_usd) if cum_loss_usd > 0 else float("inf")
 
-            # Session-level logs (net of costs)
+            # Session logs
             writer.add_scalar("session/cum_profit_usd", cum_profit_usd, step)
             writer.add_scalar("session/cum_loss_usd", cum_loss_usd, step)
             writer.add_scalar("session/net_profit_usd", net_profit_usd, step)
@@ -306,11 +289,9 @@ def train(
             # Cost logs
             writer.add_scalar("costs/cum_commission_usd", cum_commission_usd, step)
             writer.add_scalar("costs/cum_swap_usd", cum_swap_usd, step)
-            writer.add_scalar(
-                "costs/cum_other_costs_usd", cum_other_costs_usd, step
-            )
+            writer.add_scalar("costs/cum_other_costs_usd", cum_other_costs_usd, step)
 
-        # occasional histogram of trade PnL (NET)
+        # occasional histogram of trade PnL
         if step % 2000 == 0 and info.get("closed_trade", False):
             writer.add_histogram(
                 "session/trade_pnl_usd",
@@ -320,13 +301,9 @@ def train(
 
         # env-level logs
         if "equity" in info:
-            writer.add_scalar(
-                "env/equity_mark_to_market", float(info["equity"]), step
-            )
+            writer.add_scalar("env/equity_mark_to_market", float(info["equity"]), step)
         if info.get("closed_trade", False) and "balance" in info:
-            writer.add_scalar(
-                "env/balance_close_only", float(info["balance"]), step
-            )
+            writer.add_scalar("env/balance_close_only", float(info["balance"]), step)
 
         # action mix
         if a == 0:
@@ -362,6 +339,7 @@ def train(
             d = torch.from_numpy(S).float().to(device)
             a_t = torch.from_numpy(A).long().to(device)
             r_t = torch.from_numpy(R).float().to(device)
+            # Clamp to keep targets stable; env reward already scaled
             r_t = torch.clamp(r_t, -5.0, 5.0)
 
             d2 = torch.from_numpy(S2).float().to(device)
@@ -389,12 +367,8 @@ def train(
             if step % 1000 == 0:
                 td_errors = (q - y).detach().cpu().numpy()
                 writer.add_histogram("dist/td_error", td_errors, step)
-                writer.add_histogram(
-                    "dist/Q_values", q.detach().cpu().numpy(), step
-                )
-                writer.add_scalar(
-                    "train/avg_abs_Q", q.abs().mean().item(), step
-                )
+                writer.add_histogram("dist/Q_values", q.detach().cpu().numpy(), step)
+                writer.add_scalar("train/avg_abs_Q", q.abs().mean().item(), step)
 
         # --------------- Periodic logging ---------------
         if (step % log_every_steps == 0) or (step == 1):
@@ -416,27 +390,13 @@ def train(
 
             writer.add_scalar("replay/size", len(rb), step)
             total_actions = sum(action_counts.values()) or 1
-            writer.add_scalar(
-                "policy/frac_hold",
-                action_counts["hold"] / total_actions,
-                step,
-            )
-            writer.add_scalar(
-                "policy/frac_buy",
-                action_counts["buy"] / total_actions,
-                step,
-            )
-            writer.add_scalar(
-                "policy/frac_sell",
-                action_counts["sell"] / total_actions,
-                step,
-            )
+            writer.add_scalar("policy/frac_hold", action_counts["hold"] / total_actions, step)
+            writer.add_scalar("policy/frac_buy", action_counts["buy"] / total_actions, step)
+            writer.add_scalar("policy/frac_sell", action_counts["sell"] / total_actions, step)
 
             if trades > 0:
                 writer.add_scalar("trades/win_rate", wins / trades, step)
-                writer.add_scalar(
-                    "trades/avg_pnl_pips", sum_pnl_pips / trades, step
-                )
+                writer.add_scalar("trades/avg_pnl_pips", sum_pnl_pips / trades, step)
 
             writer.add_scalar(
                 "risk/max_drawdown",
@@ -471,7 +431,7 @@ def train(
     )
 
 
-# ----------------- Evaluation helper used during training -----------------
+# ----------------- Evaluation helper -----------------
 def evaluate(policy_net: nn.Module, episodes=5, device="cpu"):
     env = make_env(seed=999, eval_mode=True, reset_balance_each_episode=False)
     ret_sum, len_sum = 0.0, 0.0
@@ -496,8 +456,8 @@ if __name__ == "__main__":
     train(
         steps=2_000_000,
         batch_size=256,
-        gamma=0.998,
-        lr=1e-4,
+        gamma=0.995,
+        lr=5e-5,
         start_training=20_000,
         target_tau=0.005,
         eps_start=1.0,
