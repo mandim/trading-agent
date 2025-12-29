@@ -77,25 +77,27 @@ def compute_bar_features_from_raw(
     atr_w: int = 14,
 ) -> np.ndarray:
     """
-    Recreate EXACT bar_features layout used in preprocessing.py:
+    Recreate EXACT bar_features layout used in preprocessing.py (15 feats/bar):
 
-      bars_features = [close, ema_f, ema_s, macd, macd_sig, rsi, atr]
+      [c, ema_f, ema_s, macd, macd_sig, rsi, atr,
+       ret_1, ret_5, ret_20,
+       above_ema_slow, ema_dist,
+       price_range, ret_std_20, ret_std_50]
 
-    bars_raw is expected shape (L, >=4) with columns:
-      0=Open, 1=High, 2=Low, 3=Close, [4=Volume (ignored for indicators)]
+    bars_raw shape (L, >=4): 0=Open, 1=High, 2=Low, 3=Close, [4=Volume ignored]
     """
     bars_raw = np.asarray(bars_raw, dtype=np.float32)
     if bars_raw.ndim != 2 or bars_raw.shape[1] < 4:
-        raise ValueError(f"bars_raw must be 2D with at least 4 columns (O,H,L,C), got {bars_raw.shape}")
+        raise ValueError(f"bars_raw must be 2D with at least 4 cols (O,H,L,C), got {bars_raw.shape}")
 
-    o = bars_raw[:, 0]
     h = bars_raw[:, 1]
     l = bars_raw[:, 2]
     c = bars_raw[:, 3]
+    n = c.size
 
+    # --- Indicators (same as preprocessing.py) ---
     alpha_f = 2.0 / (ema_fast + 1.0)
     alpha_s = 2.0 / (ema_slow + 1.0)
-
     ema_f = ema_np(c, alpha_f)
     ema_s = ema_np(c, alpha_s)
     macd = (ema_f - ema_s).astype(np.float32)
@@ -103,8 +105,49 @@ def compute_bar_features_from_raw(
     rsi_vals = rsi_np(c, rsi_w)
     atr_vals = atr_np(h, l, c, atr_w)
 
-    bars_features = np.column_stack([c, ema_f, ema_s, macd, macd_sig, rsi_vals, atr_vals]).astype(np.float32)
+    # --- Multi-scale returns (match preprocessing behavior) ---
+    ret_1 = np.zeros(n, dtype=np.float32)
+    if n > 1:
+        ret_1[1:] = (c[1:] - c[:-1]) / np.maximum(1e-12, c[:-1])
+
+    ret_5 = np.zeros(n, dtype=np.float32)
+    ret_20 = np.zeros(n, dtype=np.float32)
+    if n > 5:
+        ret_5[5:] = (c[5:] / np.maximum(1e-12, c[:-5])) - 1.0
+    if n > 20:
+        ret_20[20:] = (c[20:] / np.maximum(1e-12, c[:-20])) - 1.0
+
+    # --- Regime ---
+    above_ema_slow = (c > ema_s).astype(np.float32)
+    ema_dist = ((c - ema_s) / np.maximum(1e-12, ema_s)).astype(np.float32)
+    price_range = ((h - l) / np.maximum(1e-12, c)).astype(np.float32)
+
+    # --- Rolling std of ret_1 (pandas rolling std uses ddof=1) ---
+    def rolling_std_ddof1(x: np.ndarray, window: int) -> np.ndarray:
+        out = np.empty_like(x, dtype=np.float32)
+        for i in range(x.size):
+            start = max(0, i - window + 1)
+            w = x[start:i+1].astype(np.float64)
+            if w.size < 2:
+                out[i] = np.nan  # ddof=1 undefined for <2 samples (matches pandas behavior)
+            else:
+                m = w.mean()
+                var = ((w - m) ** 2).sum() / (w.size - 1)  # ddof=1
+                out[i] = np.float32(np.sqrt(max(0.0, var)))
+        return out
+
+    ret_std_20 = rolling_std_ddof1(ret_1, 20)
+    ret_std_50 = rolling_std_ddof1(ret_1, 50)
+
+    bars_features = np.column_stack([
+        c, ema_f, ema_s, macd, macd_sig, rsi_vals, atr_vals,
+        ret_1, ret_5, ret_20,
+        above_ema_slow, ema_dist,
+        price_range, ret_std_20, ret_std_50
+    ]).astype(np.float32)
+
     return bars_features
+
 
 
 # ==== Match the training net (from train_dqn.py) ====
@@ -227,12 +270,26 @@ def load_bars_scaler(cache_dir: str, normalize_bars: bool):
 def build_obs(bar_window: np.ndarray,
               bars_mean, bars_std,
               ask: float, bid: float,
-              price_norms):
+              price_norms,
+              # position features (from EA)
+              position_side: int,
+              entry_price,
+              pos_age_bars: float,
+              pip_decimal: float,
+              sl_pips: float,
+              lot: float,
+              exchange_rate: float):
     """
-    bar_window: shape (L, n_feats), oldest->newest
-    price_norms: dict of RollingNorm instances for ask, bid, spread
+    Build observation vector aligned with TradingEnv._get_observation():
+
+      obs = [window_len * bar_features] + [ask_norm, bid_norm, spread_norm]
+            + [pos_dir, pos_pnl_R, pos_age]
+
+    Notes:
+      - position_side: 0 flat, +1 long, -1 short
+      - entry_price: for long it's entry_ask; for short it's entry_bid (see env _pnl_from_prices)
+      - pos_age is scaled similarly to env (we use bars/1000.0, not ticks/1000.0)
     """
-    # normalize bar features if scalers exist (train split stats)
     if bars_mean is not None and bars_std is not None:
         bar_window = (bar_window - bars_mean) / (bars_std + 1e-8)
 
@@ -240,19 +297,46 @@ def build_obs(bar_window: np.ndarray,
     bid = float(bid)
     spread = ask - bid
 
-    # update rolling buffers
-    price_norms["ask"].update(ask)
-    price_norms["bid"].update(bid)
-    price_norms["spread"].update(spread)
+    if isinstance(price_norms, dict):
+        price_norms["ask"].update(ask)
+        price_norms["bid"].update(bid)
+        price_norms["spread"].update(spread)
 
-    # normalize using rolling stats
-    a = price_norms["ask"].normalize(ask)
-    b = price_norms["bid"].normalize(bid)
-    s = price_norms["spread"].normalize(spread)
+        a = price_norms["ask"].normalize(ask)
+        b = price_norms["bid"].normalize(bid)
+        s = price_norms["spread"].normalize(spread)
+    else:
+        a, b, s = price_norms.normalize(ask, bid)
 
-    obs = np.hstack([bar_window.ravel(), np.array([a, b, s], dtype=np.float32)]).astype(np.float32)
+    pos_dir = 0.0
+    pos_pnl_R = 0.0
+    pos_age = float(pos_age_bars) / 1000.0
+
+    if int(position_side) != 0 and entry_price is not None:
+        pos_dir = 1.0 if int(position_side) > 0 else -1.0
+        pip_value_usd = (100000.0 * float(pip_decimal)) / max(1e-12, float(exchange_rate))
+        pip_value_usd *= float(lot)
+
+        if pos_dir > 0:
+            pnl_pips = (float(bid) - float(entry_price)) / float(pip_decimal)
+        else:
+            pnl_pips = (float(entry_price) - float(ask)) / float(pip_decimal)
+
+        float_profit_usd = float(pnl_pips) * float(pip_value_usd)
+        one_R_usd = max(1e-9, float(pip_value_usd) * float(sl_pips))
+        pos_pnl_R = float(float_profit_usd / one_R_usd)
+
+    pos_feats = np.array([pos_dir, pos_pnl_R, pos_age], dtype=np.float32)
+
+    obs = np.hstack([
+        bar_window.ravel(),
+        np.array([a, b, s], dtype=np.float32),
+        pos_feats
+    ]).astype(np.float32)
+
     obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
     return obs
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -372,7 +456,7 @@ def main():
 
         if n_feats is None:
             n_feats = int(bar_window.shape[1])
-            obs_dim = args.window_len * n_feats + 3
+            obs_dim = args.window_len * n_feats + 6
 
             # init model now that we know obs_dim
             model = QNet(obs_dim, 3).to(device)
@@ -380,8 +464,15 @@ def main():
             model.eval()
             print(f"[serve] Model ready: obs_dim={obs_dim}, n_feats={n_feats}")
 
-        obs = build_obs(bar_window, bars_mean, bars_std, float(ask), float(bid), price_norms)
-        if obs.shape[0] != (args.window_len * n_feats + 3):
+        obs = build_obs(bar_window, bars_mean, bars_std, float(ask), float(bid), price_norms,
+                      position_side=int(req.get('position_side', 0)),
+                      entry_price=req.get('entry_price', None),
+                      pos_age_bars=float(req.get('pos_age_bars', 0.0)),
+                      pip_decimal=float(req.get('pip_decimal', 0.0001)),
+                      sl_pips=float(req.get('sl_pips', 50.0)),
+                      lot=float(req.get('lot', 1.0)),
+                      exchange_rate=float(req.get('exchange_rate', 1.0)))
+        if obs.shape[0] != (args.window_len * n_feats + 6):
             sock.send_json({"ok": False, "error": "obs_dim_mismatch"})
             continue
 

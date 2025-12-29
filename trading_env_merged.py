@@ -3,40 +3,44 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-try:
-    from server import ZMQRepServer
-except Exception:
-    ZMQRepServer = None
+# try:
+#     from server import ZMQRepServer
+# except Exception:
+#     ZMQRepServer = None
 
 
 class TradingEnv(gym.Env):
     """
     DQN-ready trading environment with realistic broker costs.
 
-    Design goals:
+    Design:
       - Gymnasium API:
             reset(*, seed, options) -> (obs, info)
             step(action) -> (obs, reward, terminated, truncated, info)
-      - Discrete actions: 0=HOLD, 1=BUY, 2=SELL
-      - Tick-driven TP/SL exits
-      - Train / eval split with random starting ticks
-      - Optional price & bar normalization
-      - Simple, well-scaled reward:
-            reward = profit_usd / reward_scale_usd - λ * ΔDD
-      - Mark-to-market equity, used for drawdown and EOF closing
-      - Optional ZeroMQ server for MT4 integration
+      - Discrete actions: 0, 1, 2 interpreted based on position state:
+
+            If flat (position_side == 0):
+                0 -> WAIT        (stay flat)
+                1 -> OPEN_LONG
+                2 -> OPEN_SHORT
+
+            If in a position (position_side != 0):
+                0 -> HOLD        (keep position)
+                1 -> CLOSE       (close at market, only if min_hold_bars satisfied)
+                2 -> REVERSE     (optional; disabled by default)
+
+      - One decision per BAR OPEN; intrabar tick simulation for TP/SL.
+      - Train/eval split can be fraction-based or date-based.
+      - Reward is realized-only on trade close (in R units), with optional trade penalty.
 
     Key choices:
-      * We use the tick BID/ASK directly. Spread is implicit in those prices.
-      * No extra "spread_once" pips are subtracted; this avoids double-counting.
+      * We use tick BID/ASK directly; spread is implicit in those prices.
+      * No explicit "spread_once" pips; this avoids double-counting.
       * Lot size is fixed (no percent-risk sizing to keep dynamics simple).
     """
 
     metadata = {"render_modes": []}
 
-    # -------------------------------------------------------------------------
-    # Constructor
-    # -------------------------------------------------------------------------
     def __init__(
         self,
         pip_decimal: float,
@@ -61,19 +65,30 @@ class TradingEnv(gym.Env):
         slippage_pips_open: float = 0.0,
         slippage_pips_close: float = 0.0,
         slippage_mode: str = "fixed",   # "fixed", "uniform", "normal"
+        enable_slippage: bool = True,
+        slippage_pips: float = 0.0,   # simple fixed slippage in pips (fallback)
         other_fixed_cost_per_trade_usd: float = 0.0,
+        include_spread_cost: bool = False,   # kept for backward compatibility, not used
+        position_spreads_once_pips: float = 0.0,  # kept for backward compatibility, not used
 
         # Risk & penalties
-        dd_penalty_lambda: float = 0.5,
+        dd_penalty_lambda: float = 0.2,
+        flat_penalty_R: float = 0.01,
         max_dd_stop: float = 0.30,
+        trade_penalty_R: float = 0.2,
+        min_hold_bars: int = 3,
+        allow_reverse: bool = False,
+        cooldown_bars_after_close: int = 0,
 
         # Episode / data split
         max_steps_per_episode: int | None = 5000,
         train_fraction: float = 0.7,
         eval_mode: bool = False,
 
-        # Reward scaling
-        reward_scale_usd: float = 100.0,   # profit_usd / reward_scale_usd
+        # Date-based split (preferred). If eval_start_date is set, it overrides train_fraction.
+        eval_start_date: str | None = None,   # e.g. "2023-01-01"
+        eval_end_date: str | None = None,     # e.g. "2025-12-31" (optional)
+        train_start_date: str | None = None,  # e.g. "2019-01-01" (optional, for scaler fit + train start clamp)
 
         # Observation / normalization
         window_len: int = 32,
@@ -94,6 +109,7 @@ class TradingEnv(gym.Env):
 
         # Trading config
         self.pip_decimal = float(pip_decimal)
+        self.pip_size = self.pip_decimal  # alias
         self.tp_pips = float(tp_pips)
         self.sl_pips = float(sl_pips)
         self.lot = float(lot)
@@ -110,19 +126,32 @@ class TradingEnv(gym.Env):
         self.slippage_pips_open = float(slippage_pips_open)
         self.slippage_pips_close = float(slippage_pips_close)
         self.slippage_mode = slippage_mode
+        self.enable_slippage = bool(enable_slippage)
+        self.slippage_pips = float(slippage_pips)
         self.other_fixed_cost_per_trade_usd = float(other_fixed_cost_per_trade_usd)
+
+        # kept for backward compatibility; spread is implicit in bid/ask
+        self.include_spread_cost = bool(include_spread_cost)
+        self.position_spreads_once_pips = float(position_spreads_once_pips)
 
         # Risk & penalties
         self.dd_penalty_lambda = float(dd_penalty_lambda)
         self.max_dd_stop = float(max_dd_stop)
+        self.trade_penalty_R = float(trade_penalty_R)
+        self.min_hold_bars = int(min_hold_bars)
+        self.allow_reverse = bool(allow_reverse)
+        self.cooldown_bars_after_close = int(cooldown_bars_after_close)
+        self.cooldown_remaining = 0
+        self.flat_penalty_R = float(flat_penalty_R)
 
         # Episode / split
         self.max_steps_per_episode = int(max_steps_per_episode) if max_steps_per_episode is not None else None
         self.train_fraction = float(train_fraction)
         self.eval_mode = bool(eval_mode)
 
-        # Reward
-        self.reward_scale_usd = float(reward_scale_usd)
+        self.eval_start_date = eval_start_date
+        self.eval_end_date = eval_end_date
+        self.train_start_date = train_start_date
 
         # Observation config
         self.window_len = int(window_len)
@@ -132,19 +161,16 @@ class TradingEnv(gym.Env):
         # RNG
         self._rng = np.random.default_rng(seed if seed is not None else 0)
 
-        # Load cached data
-        self._load_cache(self.cache_dir)  # sets: bar_features, tick_ask, tick_bid, tick_to_bar, etc.
+        # Load cached data (also computes split indices + bars scaler)
+        self._load_cache(self.cache_dir)
 
-        # Gym spaces:
-        #   - window_len * n_feats from bar_features
-        #   - 3 price features  : [ask_norm, bid_norm, spread_norm]
-        #   - 3 position features: [pos_dir, pos_pnl_R, pos_age]
-        self.extra_obs_dim = 3 + 3
+        # Observation: window_len * n_feats + (price_feats=3) + (pos_feats=3)
+        self.extra_obs_dim = 6
         self.obs_dim = self.window_len * self.n_feats + self.extra_obs_dim
 
         high = np.full((self.obs_dim,), 1e6, dtype=np.float32)
         self.observation_space = spaces.Box(low=-high, high=high, dtype=np.float32)
-        self.action_space = spaces.Discrete(3)  # 0=HOLD,1=BUY,2=SELL
+        self.action_space = spaces.Discrete(3)
 
         # Account / episode state
         self.balance = self.start_balance
@@ -163,8 +189,7 @@ class TradingEnv(gym.Env):
         self.cumulative_other_costs = 0.0
 
         # Position state
-        # 0 = flat, +1 = long, -1 = short
-        self.position_side = 0
+        self.position_side = 0  # 0 flat, +1 long, -1 short
         self.position_entry_idx = None
         self.position_entry_ask = None
         self.position_entry_bid = None
@@ -173,18 +198,18 @@ class TradingEnv(gym.Env):
         self.position_is_long = None
         self.position_duration_ticks = 0
 
-        # Normalization anchors
+        # Normalization anchors (price)
         self.ask_mean = self.ask_std = None
         self.bid_mean = self.bid_std = None
         self.spread_mean = self.spread_std = None
 
-        # Optional ZMQ server
+        # Optional ZMQ server placeholder (avoid attribute errors)
         self.server = None
-        if start_server and ZMQRepServer is not None:
-            self.server = ZMQRepServer(bind_address, self._handle_request)
+        # if start_server and ZMQRepServer is not None:
+        #     self.server = ZMQRepServer(bind_address, self._handle_request)
 
     # -------------------------------------------------------------------------
-    # ZeroMQ (optional)
+    # Optional server
     # -------------------------------------------------------------------------
     def start_server(self):
         if self.server is not None:
@@ -197,26 +222,42 @@ class TradingEnv(gym.Env):
             self.server.stop()
 
     def _handle_request(self, request):
-        """
-        Minimal ZMQ handler. Expected payload:
-            {"cmd": "HOLD"|"BUY"|"SELL"}
-        Returns step info in a compact dict.
-        """
         if not isinstance(request, dict):
             return {"reply": "invalid_request"}
 
-        cmd = request.get("cmd")
-        mapping = {"HOLD": 0, "BUY": 1, "SELL": 2}
-        if cmd in mapping:
-            obs, reward, terminated, truncated, info = self.step(mapping[cmd])
-            return {
-                "obs": obs.tolist(),
-                "reward": float(reward),
-                "terminated": bool(terminated),
-                "truncated": bool(truncated),
-                "info": info,
-            }
-        return {"reply": "unknown_command", "received": request}
+        cmd = str(request.get("cmd", "")).upper().strip()
+
+        if cmd == "HOLD":
+            action = 0
+        elif cmd == "CLOSE":
+            action = 1 if self.position_side != 0 else 0
+        elif cmd == "BUY":
+            if self.position_side == 0:
+                action = 1
+            elif self.position_side < 0:
+                action = 2
+            else:
+                action = 0
+        elif cmd == "SELL":
+            if self.position_side == 0:
+                action = 2
+            elif self.position_side > 0:
+                action = 2
+            else:
+                action = 0
+        elif cmd == "REVERSE":
+            action = 2
+        else:
+            return {"reply": "unknown_command", "received": request}
+
+        obs, reward, terminated, truncated, info = self.step(action)
+        return {
+            "obs": obs.tolist(),
+            "reward": float(reward),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "info": info,
+        }
 
     # -------------------------------------------------------------------------
     # Gymnasium API
@@ -263,13 +304,16 @@ class TradingEnv(gym.Env):
         if base >= self.n_ticks:
             raise ValueError("Warmup exceeds available ticks; check window_len or data.")
 
-        split_tick = int(self.n_ticks * self.train_fraction)
+        # Enforce train_start_date for training mode (prevents sampling before requested start)
+        if (not self.eval_mode) and (self.train_start_bar is not None) and (int(self.train_start_bar) > 0):
+            train_start_tick = self._bar_to_tick_index(int(self.train_start_bar))
+            base = max(base, int(train_start_tick))
+
+        split_tick = int(self.split_tick) if self.split_tick is not None else int(self.n_ticks * self.train_fraction)
 
         if self.eval_mode:
-            # Deterministic MT4-style evaluation on last 30% region
             self.t = max(base, split_tick)
         else:
-            # Training: random start in [base, split_tick)
             start_low = base
             start_high = max(start_low + 1, split_tick)
             if start_low >= start_high:
@@ -286,444 +330,149 @@ class TradingEnv(gym.Env):
         return obs, {}
 
     def step(self, action: int):
-        # If episode already ended, no-op
         if self.terminated or self.truncated:
-            return self._get_observation(self.t), 0.0, self.terminated, self.truncated, {
-                "note": "episode already ended"
-            }
+            return self._get_observation(self.t), 0.0, True, True, {}
 
-        # End-of-data guard: close open trade MTM and end
+        # ---- helpers ----
+        def is_bar_open(idx: int) -> bool:
+            if idx <= 0:
+                return True
+            return int(self.tick_to_bar[idx]) != int(self.tick_to_bar[idx - 1])
+
+        def advance_to_bar_open():
+            while self.t < (self.n_ticks - 1) and not is_bar_open(self.t):
+                self.t += 1
+
+        def bar_of(idx: int) -> int:
+            return int(self.tick_to_bar[min(max(idx, 0), self.n_ticks - 1)])
+
+        # ---- 0) align to decision point ----
+        advance_to_bar_open()
+
+        # If eval_end_date is set, stop evaluation once we reach/past that bar.
+        if self.eval_mode and (self.eval_end_bar is not None):
+            cur_bar = int(self.tick_to_bar[self.t])
+            if cur_bar >= int(self.eval_end_bar):
+                self.terminated = True
+                return self._get_observation(self.t), 0.0, True, False, {}
+
         if self.t >= self.n_ticks - 1:
-            reward, info = self._handle_eof()
-            obs = self._get_observation(self.n_ticks - 1)
-            return obs, float(reward), True, bool(self.truncated), info
+            self.terminated = True
+            return self._get_observation(self.t), 0.0, True, False, {}
 
-        # Determine if this tick is first of its bar (for eval bar-open gating)
-        cur_bar = int(self.tick_to_bar[self.t])
-        prev_bar = int(self.tick_to_bar[self.t - 1]) if self.t > 0 else -1
-        is_new_bar = (cur_bar != prev_bar)
+        # cache for info / drawdown updates
+        _ = float(self._equity_mtm())  # equity_prev not used in realized-only reward version
 
-        # Update price normalizers on each new bar
-        if is_new_bar:
-            self._update_price_normalizers(self.t)
-
-        # In eval_mode, only act on bar opens
-        if self.eval_mode and not is_new_bar:
-            action = 0  # force HOLD
-
-        # Map action code
-        if action == 0:
-            act = "HOLD"
-        elif action == 1:
-            act = "BUY"
-        elif action == 2:
-            act = "SELL"
-        else:
-            act = "HOLD"
-
-        # Current prices
-        bid = float(self.tick_bid[self.t])
-        ask = float(self.tick_ask[self.t])
-
+        # bookkeeping (per decision step)
+        opened_trade = False
         closed_trade = False
-        net_profit_usd = 0.0
-        gross_profit_usd = 0.0
-        pnl_pips = 0.0
-        commission_usd = 0.0
-        swap_usd = 0.0
-        other_cost_usd = 0.0
-        profit_R = 0.0  # keep for logging only; 1R = sl_pips * pip_value
-        trade_duration_ticks = 0
-        dd_now = float(self.max_drawdown)
-        new_dd_increment = 0.0
+        reversed_trade = False
+        blocked_by_cooldown = False
 
-        # =====================================================================
-        # 1) Check TP/SL for existing position
-        # =====================================================================
+        # Cooldown: prevent re-entry for N bars after any close (tp/sl/manual/eoe)
+        if self.cooldown_remaining > 0 and self.position_side == 0 and action in (1, 2):
+            blocked_by_cooldown = True
+            action = 0  # force WAIT while flat
+
+        # Decrement cooldown counter *after* potential blocking check (counts bars)
+        if self.cooldown_remaining > 0:
+            self.cooldown_remaining -= 1
+
+        exit_reason = None
+
+        trade_pnl_pips = 0.0
+        trade_pnl_usd = 0.0
+        trade_profit_R = 0.0
+        is_profitable = False
+
+        # For R normalization
+        pip_value = float(self._pip_value_usd())
+        one_R_usd = max(1e-9, pip_value * float(self.sl_pips))
+
+        # current prices at bar open
+        bid0 = float(self.tick_bid[self.t])
+        ask0 = float(self.tick_ask[self.t])
+
+        # compute how long we've held (bars)
+        pos_age_bars = 0
         if self.position_side != 0 and self.position_entry_idx is not None:
+            pos_age_bars = bar_of(self.t) - bar_of(self.position_entry_idx)
+
+        can_manual_exit = (pos_age_bars >= int(self.min_hold_bars))
+
+        # ---- commission/slippage helpers ----
+        self._last_commission_usd = 0.0
+        self._last_swap_usd = 0.0
+        self._last_other_cost_usd = 0.0
+
+        def apply_commission_side():
+            if bool(self.enable_commission):
+                c = float(self._commission_usd(round_turn=False))
+                self.balance -= c
+                self.cumulative_commission += c
+                self._last_commission_usd += c
+
+        def apply_slippage(price: float, is_entry: bool, is_long: bool) -> float:
+            if not bool(self.enable_slippage):
+                return price
+
+            base_pips = float(self.slippage_pips_open if is_entry else self.slippage_pips_close)
+            if base_pips <= 0.0:
+                base_pips = float(self.slippage_pips)
+
+            slip_pips = float(self._sample_slippage(base_pips))
+            slip = slip_pips * float(self.pip_decimal)
+
+            if is_entry:
+                return price + slip if is_long else price - slip
+            else:
+                return price - slip if is_long else price + slip
+
+        def close_position(reason: str):
+            nonlocal trade_pnl_pips, trade_pnl_usd, trade_profit_R, is_profitable, exit_reason
+
+            bid = float(self.tick_bid[self.t])
+            ask = float(self.tick_ask[self.t])
             is_long = bool(self.position_is_long)
-            self.position_duration_ticks += 1
 
-            exit_reason = None
+            close_bid = apply_slippage(bid, is_entry=False, is_long=True)    # long exits on bid
+            close_ask = apply_slippage(ask, is_entry=False, is_long=False)   # short exits on ask
 
-            if is_long:
-                # long -> TP/SL evaluated on BID
-                if self.position_tp is not None and bid >= self.position_tp:
-                    exit_reason = "tp"
-                elif self.position_sl is not None and bid <= self.position_sl:
-                    exit_reason = "sl"
+            trade_pnl_pips = float(self._pnl_from_prices(
+                is_long=is_long,
+                entry_ask=float(self.position_entry_ask),
+                entry_bid=float(self.position_entry_bid),
+                close_bid=float(close_bid),
+                close_ask=float(close_ask),
+            ))
+            trade_pnl_usd = float(trade_pnl_pips) * pip_value
+            self.balance += trade_pnl_usd
+
+            # commission on close
+            apply_commission_side()
+
+            # swap + other fixed costs (charged on close)
+            if self.position_entry_idx is not None:
+                swap_usd = float(self._compute_swap_usd(
+                    is_long=is_long,
+                    entry_idx=int(self.position_entry_idx),
+                    exit_idx=int(self.t),
+                ))
             else:
-                # short -> TP/SL evaluated on ASK
-                if self.position_tp is not None and ask <= self.position_tp:
-                    exit_reason = "tp"
-                elif self.position_sl is not None and ask >= self.position_sl:
-                    exit_reason = "sl"
+                swap_usd = 0.0
 
-            if exit_reason is not None:
-                exit_idx = self.t
-
-                # Closing price base (before slippage)
-                if is_long:
-                    close_px_bid = bid
-                    close_px_ask = ask
-                else:
-                    close_px_bid = bid
-                    close_px_ask = ask
-
-                # Slippage on close, if any
-                if self.slippage_pips_close > 0.0:
-                    slip = self._sample_slippage(self.slippage_pips_close) * self.pip_decimal
-                    if is_long:
-                        close_px_bid -= slip  # worse price when closing long
-                    else:
-                        close_px_ask += slip  # worse price when closing short
-
-                # Base PnL in pips
-                if exit_reason == "tp":
-                    base_pips = self.tp_pips
-                elif exit_reason == "sl":
-                    base_pips = -self.sl_pips
-                else:
-                    base_pips = self._pnl_from_prices(
-                        is_long,
-                        self.position_entry_ask,
-                        self.position_entry_bid,
-                        close_px_bid,
-                        close_px_ask,
-                    )
-
-                pnl_pips = float(base_pips)
-                pip_value = self._pip_value_usd()
-                gross_profit_usd = float(pnl_pips * pip_value)
-                trade_duration_ticks = int(self.position_duration_ticks)
-
-                # Swaps
-                swap_usd = self._compute_swap_usd(is_long, self.position_entry_idx, exit_idx)
-
-                # Commission & other costs
-                commission_usd = self._commission_usd(round_turn=True)
-                other_cost_usd = float(self.other_fixed_cost_per_trade_usd)
-
-                # Net PnL
-                net_profit_usd = gross_profit_usd + swap_usd - commission_usd - other_cost_usd
-
-                # Track cumulative costs
-                self.cumulative_commission += commission_usd
+            if bool(self.enable_swaps) and swap_usd != 0.0:
+                self.balance -= swap_usd
                 self.cumulative_swap += swap_usd
-                self.cumulative_other_costs += other_cost_usd
+                self._last_swap_usd += swap_usd
 
-                # Update balance & equity, drawdown
-                next_balance = self.balance + net_profit_usd
-                if next_balance <= 0.0:
-                    self.balance = 0.0
-                    self.equity = 0.0
-                    self.terminated = True
-                    self.truncated = True
-                else:
-                    self.balance = float(next_balance)
-                    self.equity = self._equity_mtm()
+            other_usd = float(self.other_fixed_cost_per_trade_usd) if float(self.other_fixed_cost_per_trade_usd) != 0.0 else 0.0
+            if other_usd != 0.0:
+                self.balance -= other_usd
+                self.cumulative_other_costs += other_usd
+                self._last_other_cost_usd += other_usd
 
-                if self.equity > self.equity_peak:
-                    self.equity_peak = float(self.equity)
-
-                if self.equity_peak > 0.0:
-                    dd_now = max(0.0, (self.equity_peak - self.equity) / self.equity_peak)
-                else:
-                    dd_now = 0.0
-
-                new_dd_increment = max(0.0, dd_now - self.max_drawdown)
-                if dd_now > self.max_drawdown:
-                    self.max_drawdown = float(dd_now)
-
-                if self.max_drawdown >= self.max_dd_stop:
-                    self.terminated = True
-                    self.truncated = True
-
-                # 1R reference for logging
-                one_R_usd = max(1e-8, self._pip_value_usd() * self.sl_pips)
-                profit_R = float(net_profit_usd / one_R_usd)
-
-                closed_trade = True
-
-                # Clear position state
-                self.position_side = 0
-                self.position_entry_idx = None
-                self.position_entry_ask = None
-                self.position_entry_bid = None
-                self.position_tp = None
-                self.position_sl = None
-                self.position_is_long = None
-                self.position_duration_ticks = 0
-
-        # =====================================================================
-        # 2) Process action (open new trade only if flat)
-        # =====================================================================
-        if self.position_side == 0 and not self.terminated and not self.truncated:
-            if act == "BUY":
-                entry_idx = self.t
-                entry_ask = ask
-                entry_bid = bid
-
-                # Slippage on open
-                if self.slippage_pips_open > 0.0:
-                    slip = self._sample_slippage(self.slippage_pips_open) * self.pip_decimal
-                    entry_ask += slip  # pay more for long entry
-
-                tp_value = entry_ask + self.tp_pips * self.pip_decimal
-                sl_value = entry_bid - self.sl_pips * self.pip_decimal
-
-                self.position_side = 1
-                self.position_entry_idx = entry_idx
-                self.position_entry_ask = entry_ask
-                self.position_entry_bid = entry_bid
-                self.position_tp = tp_value
-                self.position_sl = sl_value
-                self.position_is_long = True
-                self.position_duration_ticks = 0
-
-            elif act == "SELL":
-                entry_idx = self.t
-                entry_ask = ask
-                entry_bid = bid
-
-                # Slippage on open
-                if self.slippage_pips_open > 0.0:
-                    slip = self._sample_slippage(self.slippage_pips_open) * self.pip_decimal
-                    entry_bid -= slip  # receive less on short entry
-
-                tp_value = entry_bid - self.tp_pips * self.pip_decimal
-                sl_value = entry_ask + self.sl_pips * self.pip_decimal
-
-                self.position_side = -1
-                self.position_entry_idx = entry_idx
-                self.position_entry_ask = entry_ask
-                self.position_entry_bid = entry_bid
-                self.position_tp = tp_value
-                self.position_sl = sl_value
-                self.position_is_long = False
-                self.position_duration_ticks = 0
-            # HOLD when flat: do nothing
-
-                # =====================================================================
-        
-        # 3) Reward & bookkeeping (including step-limit truncation)
-        # =====================================================================
-        self.steps += 1
-        hit_step_limit = (
-            self.max_steps_per_episode is not None
-            and self.steps >= self.max_steps_per_episode
-        )
-
-        # If we hit the step limit and still have an open trade that did NOT
-        # close via TP/SL above, force-close it mark-to-market at current tick.
-        if hit_step_limit and not self.terminated:
-            if self.position_side != 0 and self.position_entry_idx is not None and not closed_trade:
-                exit_idx = self.t
-                bid_now = float(self.tick_bid[exit_idx])
-                ask_now = float(self.tick_ask[exit_idx])
-                is_long = bool(self.position_is_long)
-
-                self.position_duration_ticks += 1
-                trade_duration_ticks = int(self.position_duration_ticks)
-
-                base_pips = self._pnl_from_prices(
-                    is_long,
-                    self.position_entry_ask,
-                    self.position_entry_bid,
-                    bid_now,
-                    ask_now,
-                )
-                pnl_pips = float(base_pips)
-                pip_value = self._pip_value_usd()
-                gross_profit_usd = float(pnl_pips * pip_value)
-
-                # Swaps
-                swap_usd = self._compute_swap_usd(is_long, self.position_entry_idx, exit_idx)
-
-                # Commission & other costs
-                commission_usd = self._commission_usd(round_turn=True)
-                other_cost_usd = float(self.other_fixed_cost_per_trade_usd)
-
-                net_profit_usd = gross_profit_usd + swap_usd - commission_usd - other_cost_usd
-
-                # Track costs
-                self.cumulative_commission += commission_usd
-                self.cumulative_swap += swap_usd
-                self.cumulative_other_costs += other_cost_usd
-
-                # Update balance/equity & drawdown
-                next_balance = self.balance + net_profit_usd
-                if next_balance <= 0.0:
-                    self.balance = 0.0
-                    self.equity = 0.0
-                    self.terminated = True
-                else:
-                    self.balance = float(next_balance)
-                    self.equity = self._equity_mtm()
-
-                if self.equity > self.equity_peak:
-                    self.equity_peak = float(self.equity)
-                if self.equity_peak > 0.0:
-                    dd_now = max(0.0, (self.equity_peak - self.equity) / self.equity_peak)
-                else:
-                    dd_now = 0.0
-
-                new_dd_increment = max(0.0, dd_now - self.max_drawdown)
-                if dd_now > self.max_drawdown:
-                    self.max_drawdown = float(dd_now)
-
-                # 1R for logging
-                one_R_usd = max(1e-8, self._pip_value_usd() * self.sl_pips)
-                profit_R = float(net_profit_usd / one_R_usd)
-
-                closed_trade = True
-
-                # Clear position
-                self.position_side = 0
-                self.position_entry_idx = None
-                self.position_entry_ask = None
-                self.position_entry_bid = None
-                self.position_tp = None
-                self.position_sl = None
-                self.position_is_long = None
-                self.position_duration_ticks = 0
-
-            # Mark episode as truncated by step limit
-            self.truncated = True
-
-        # Final reward for this step
-        if closed_trade:
-            reward = self._calculate_reward(
-                profit_usd=net_profit_usd,
-                new_dd_increment=new_dd_increment,
-            )
-        else:
-            reward = 0.0
-
-        # Move to next tick if we are still alive
-        if not self.terminated and not self.truncated:
-            self.t += 1
-            self.current_tick_row = self.t
-
-        terminated_flag = bool(self.terminated)
-
-        info = {
-
-            "action": act,
-            "final_idx": int(self.t),
-            "balance": float(self.balance),
-            "equity": float(self._equity_mtm()),
-            "equity_peak": float(self.equity_peak),
-            "dd_now": float(dd_now),
-            "max_drawdown": float(self.max_drawdown),
-            "new_dd_increment": float(new_dd_increment),
-            "is_profitable": net_profit_usd >= 0.0 if closed_trade else False,
-            "last_reward": float(reward),
-
-            "profit_gross_usd": float(gross_profit_usd),
-            "profit_net_usd": float(net_profit_usd),
-            "profit": float(net_profit_usd),
-            "profit_R": float(profit_R),
-            "pnl_pips": float(pnl_pips),
-            "swap_usd": float(swap_usd),
-            "commission_usd": float(commission_usd),
-            "other_cost_usd": float(other_cost_usd),
-            "cumulative_commission": float(self.cumulative_commission),
-            "cumulative_swap": float(self.cumulative_swap),
-            "cumulative_other_costs": float(self.cumulative_other_costs),
-
-            "trade_duration_ticks": int(trade_duration_ticks),
-            "eof": bool(self.t >= self.n_ticks - 1),
-            "closed_trade": closed_trade,
-        }
-
-        obs = self._get_observation(min(self.t, self.n_ticks - 1))
-        return obs, float(reward), terminated_flag, bool(self.truncated), info
-
-    # -------------------------------------------------------------------------
-    # EOF handling (close any open trade MTM)
-    # -------------------------------------------------------------------------
-    def _handle_eof(self):
-        closed_trade = False
-        net_profit_usd = 0.0
-        trade_duration_ticks = 0
-        pnl_pips = 0.0
-        gross_profit_usd = 0.0
-        commission_usd = 0.0
-        swap_usd = 0.0
-        other_cost_usd = 0.0
-        profit_R = 0.0
-        dd_now = float(self.max_drawdown)
-        new_dd_increment = 0.0
-
-        if self.position_side != 0 and self.position_entry_idx is not None:
-            exit_idx = self.n_ticks - 1
-            bid = float(self.tick_bid[exit_idx])
-            ask = float(self.tick_ask[exit_idx])
-
-            is_long = bool(self.position_is_long)
-            self.position_duration_ticks += 1
-            trade_duration_ticks = int(self.position_duration_ticks)
-
-            base_pips = self._pnl_from_prices(
-                is_long,
-                self.position_entry_ask,
-                self.position_entry_bid,
-                bid,
-                ask,
-            )
-
-            pnl_pips = float(base_pips)
-            pip_value = self._pip_value_usd()
-            gross_profit_usd = float(pnl_pips * pip_value)
-
-            # Swaps
-            swap_usd = self._compute_swap_usd(is_long, self.position_entry_idx, exit_idx)
-
-            # Commission & other costs
-            commission_usd = self._commission_usd(round_turn=True)
-            other_cost_usd = float(self.other_fixed_cost_per_trade_usd)
-
-            net_profit_usd = gross_profit_usd + swap_usd - commission_usd - other_cost_usd
-
-            # Track costs
-            self.cumulative_commission += commission_usd
-            self.cumulative_swap += swap_usd
-            self.cumulative_other_costs += other_cost_usd
-
-            # Update equity & drawdown
-            next_balance = self.balance + net_profit_usd
-            if next_balance <= 0.0:
-                self.balance = 0.0
-                self.equity = 0.0
-                self.terminated = True
-                self.truncated = True
-            else:
-                self.balance = float(next_balance)
-                self.equity = self._equity_mtm()
-
-            if self.equity > self.equity_peak:
-                self.equity_peak = float(self.equity)
-
-            if self.equity_peak > 0.0:
-                dd_now = max(0.0, (self.equity_peak - self.equity) / self.equity_peak)
-            else:
-                dd_now = 0.0
-
-            new_dd_increment = max(0.0, dd_now - self.max_drawdown)
-            if dd_now > self.max_drawdown:
-                self.max_drawdown = float(dd_now)
-
-            if self.max_drawdown >= self.max_dd_stop:
-                self.terminated = True
-                self.truncated = True
-
-            one_R_usd = max(1e-8, self._pip_value_usd() * self.sl_pips)
-            profit_R = float(net_profit_usd / one_R_usd)
-
-            closed_trade = True
-
-            # Clear position
+            # clear position
             self.position_side = 0
             self.position_entry_idx = None
             self.position_entry_ask = None
@@ -733,57 +482,183 @@ class TradingEnv(gym.Env):
             self.position_is_long = None
             self.position_duration_ticks = 0
 
-        reward = self._calculate_reward(
-            profit_usd=net_profit_usd,
-            new_dd_increment=new_dd_increment,
-        )
+            exit_reason = reason
+            trade_profit_R = float(trade_pnl_usd) / one_R_usd
+            is_profitable = (trade_pnl_usd > 0.0)
 
-        self.terminated = True
+        # ---- 1) apply action once (at bar open) ----
+        if self.position_side == 0:
+            if action == 1:
+                opened_trade = True
+                apply_commission_side()
+                entry_ask = apply_slippage(ask0, is_entry=True, is_long=True)
+                entry_bid = bid0
+                self.position_side = 1
+                self.position_entry_idx = self.t
+                self.position_entry_ask = float(entry_ask)
+                self.position_entry_bid = float(entry_bid)
+                self.position_is_long = True
+                self.position_tp = float(self.position_entry_ask + float(self.tp_pips) * float(self.pip_decimal))
+                self.position_sl = float(self.position_entry_bid - float(self.sl_pips) * float(self.pip_decimal))
+            elif action == 2:
+                opened_trade = True
+                apply_commission_side()
+                entry_bid = apply_slippage(bid0, is_entry=True, is_long=False)
+                entry_ask = ask0
+                self.position_side = -1
+                self.position_entry_idx = self.t
+                self.position_entry_ask = float(entry_ask)
+                self.position_entry_bid = float(entry_bid)
+                self.position_is_long = False
+                self.position_tp = float(self.position_entry_bid - float(self.tp_pips) * float(self.pip_decimal))
+                self.position_sl = float(self.position_entry_ask + float(self.sl_pips) * float(self.pip_decimal))
+        else:
+            if action == 1 and can_manual_exit:
+                closed_trade = True
+                close_position("manual_close")
+            elif action == 2 and bool(self.allow_reverse) and can_manual_exit:
+                reversed_trade = True
+                closed_trade = True
+                prev_long = bool(self.position_is_long)
+                close_position("reverse_close")
+
+                # open opposite
+                if prev_long:
+                    opened_trade = True
+                    apply_commission_side()
+                    entry_bid = apply_slippage(bid0, is_entry=True, is_long=False)
+                    entry_ask = ask0
+                    self.position_side = -1
+                    self.position_entry_idx = self.t
+                    self.position_entry_ask = float(entry_ask)
+                    self.position_entry_bid = float(entry_bid)
+                    self.position_is_long = False
+                    self.position_tp = float(self.position_entry_bid - float(self.tp_pips) * float(self.pip_decimal))
+                    self.position_sl = float(self.position_entry_ask + float(self.sl_pips) * float(self.pip_decimal))
+                else:
+                    opened_trade = True
+                    apply_commission_side()
+                    entry_ask = apply_slippage(ask0, is_entry=True, is_long=True)
+                    entry_bid = bid0
+                    self.position_side = 1
+                    self.position_entry_idx = self.t
+                    self.position_entry_ask = float(entry_ask)
+                    self.position_entry_bid = float(entry_bid)
+                    self.position_is_long = True
+                    self.position_tp = float(self.position_entry_ask + float(self.tp_pips) * float(self.pip_decimal))
+                    self.position_sl = float(self.position_entry_bid - float(self.sl_pips) * float(self.pip_decimal))
+            # else HOLD
+
+        # ---- 2) simulate intrabar until next bar open ----
+        cur_bar = bar_of(self.t)
+        i = self.t
+        while i < self.n_ticks - 1:
+            if i > self.t and bar_of(i) != cur_bar:
+                break
+            self.t = i
+
+            if self.position_side != 0:
+                self.position_duration_ticks += 1
+
+            if self.position_side != 0 and not closed_trade:
+                bid = float(self.tick_bid[self.t])
+                ask = float(self.tick_ask[self.t])
+                if bool(self.position_is_long):
+                    if bid >= float(self.position_tp):
+                        closed_trade = True
+                        close_position("tp")
+                    elif bid <= float(self.position_sl):
+                        closed_trade = True
+                        close_position("sl")
+                else:
+                    if ask <= float(self.position_tp):
+                        closed_trade = True
+                        close_position("tp")
+                    elif ask >= float(self.position_sl):
+                        closed_trade = True
+                        close_position("sl")
+
+            i += 1
+
+        # move to next decision point (next bar open)
+        self.t = min(i, self.n_ticks - 1)
+        advance_to_bar_open()
+
+        # step counter / termination
+        self.steps += 1
+        if self.max_steps_per_episode is not None and self.steps >= int(self.max_steps_per_episode):
+            self.truncated = True
+        if self.t >= self.n_ticks - 1:
+            self.terminated = True
+
+        # forced close at end of episode
+        if (self.terminated or self.truncated) and self.position_side != 0 and not closed_trade:
+            closed_trade = True
+            close_position("eoe_close")
+
+        # update equity / drawdown stats
+        equity_now = float(self._equity_mtm())
+        self.equity = equity_now
+        if self.equity > self.equity_peak:
+            self.equity_peak = self.equity
+
+        dd = 0.0
+        if self.equity_peak > 0:
+            dd = (self.equity_peak - self.equity) / self.equity_peak
+        if dd > self.max_drawdown:
+            self.max_drawdown = dd
+        if self.max_drawdown >= float(self.max_dd_stop):
+            self.truncated = True
+
+        # ---- 3) reward: realized only ----
+        reward = 0.0
+        if closed_trade:
+            reward = float(trade_profit_R - float(self.trade_penalty_R))
+        else:
+            if self.position_side == 0 and action == 0 and float(self.flat_penalty_R) > 0:
+                reward = -float(self.flat_penalty_R)
+
+        obs = self._get_observation(self.t)
+
+        # If we closed a trade this step, start cooldown from next bar
+        if closed_trade and self.cooldown_bars_after_close > 0:
+            self.cooldown_remaining = int(self.cooldown_bars_after_close)
 
         info = {
-            "action": "HOLD",
-            "final_idx": int(self.n_ticks - 1),
-            "balance": float(self.balance),
+            "t": int(self.t),
+            "bar_index": int(self.tick_to_bar[self.t]),
             "equity": float(self.equity),
-            "equity_peak": float(self.equity_peak),
-            "dd_now": float(dd_now),
+            "balance": float(self.balance),
+            "position_side": int(self.position_side),
             "max_drawdown": float(self.max_drawdown),
-            "new_dd_increment": float(new_dd_increment),
-            "is_profitable": net_profit_usd >= 0.0,
-            "last_reward": float(reward),
-            "profit_gross_usd": float(gross_profit_usd),
-            "profit_net_usd": float(net_profit_usd),
-            "profit": float(net_profit_usd),
-            "profit_R": float(profit_R),
-            "pnl_pips": float(pnl_pips),
-            "swap_usd": float(swap_usd),
-            "commission_usd": float(commission_usd),
-            "other_cost_usd": float(other_cost_usd),
-            "cumulative_commission": float(self.cumulative_commission),
-            "cumulative_swap": float(self.cumulative_swap),
-            "cumulative_other_costs": float(self.cumulative_other_costs),
-            "trade_duration_ticks": int(trade_duration_ticks),
-            "eof": True,
-            "closed_trade": closed_trade,
-            "reason": "eof",
+
+            "opened_trade": bool(opened_trade),
+            "closed_trade": bool(closed_trade),
+            "reversed_trade": bool(reversed_trade),
+            "exit_reason": exit_reason,
+
+            "profit": float(trade_pnl_usd),
+            "profit_R": float(trade_profit_R),
+            "pnl_pips": float(trade_pnl_pips),
+            "is_profitable": bool(is_profitable),
+
+            "commission_usd": float(getattr(self, "_last_commission_usd", 0.0)),
+            "swap_usd": float(getattr(self, "_last_swap_usd", 0.0)),
+            "other_cost_usd": float(getattr(self, "_last_other_cost_usd", 0.0)),
+
+            # NEW: expose cooldown diagnostics (for TB + debugging)
+            "blocked_by_cooldown": bool(blocked_by_cooldown),
+            "cooldown_remaining": int(self.cooldown_remaining),
         }
-        return reward, info
+        return obs, float(reward), bool(self.terminated), bool(self.truncated), info
 
     # -------------------------------------------------------------------------
-    # Helpers
+    # Normalization / sampling helpers
     # -------------------------------------------------------------------------
     def _update_price_normalizers(self, tick_idx: int):
-        """
-        Update running mean/std for ask, bid, spread used in price normalization.
-
-        For simplicity we compute statistics over all ticks up to `tick_idx`
-        (training region). This is called on each new bar, so it's not *every*
-        tick, and it's fine performance-wise for offline training.
-        """
         if not self.normalize_prices:
             return
 
-        # Guard
         if tick_idx <= 0:
             window_ask = self.tick_ask[:1].astype(np.float32)
             window_bid = self.tick_bid[:1].astype(np.float32)
@@ -802,17 +677,12 @@ class TradingEnv(gym.Env):
 
         self.spread_mean = float(window_spread.mean())
         self.spread_std = float(window_spread.std() + 1e-8)
-    
+
     def _sample_slippage(self, base_pips: float) -> float:
-        """
-        Returns slippage in *pips* (>=0 for our worse-price convention).
-        base_pips is the configured slippage_pips_*.
-        """
         if base_pips <= 0:
             return 0.0
 
         mode = (self.slippage_mode or "fixed").lower()
-
         if mode == "fixed":
             return base_pips
         if mode == "uniform":
@@ -822,47 +692,24 @@ class TradingEnv(gym.Env):
         return base_pips
 
     def _pip_value_usd_per_lot(self) -> float:
-        """Value of 1 pip (pip_decimal) in USD for 1.0 lot."""
         return (100000.0 * self.pip_decimal) / max(1e-12, self.exchange_rate)
 
     def _pip_value_usd(self) -> float:
-        """Value of 1 pip in USD for the current lot size."""
         return self._pip_value_usd_per_lot() * self.lot
 
     def _commission_usd(self, round_turn: bool = False) -> float:
-        """Commission in USD for this trade (fixed lot size)."""
         if not self.enable_commission or self.commission_per_lot_per_side_usd <= 0.0:
             return 0.0
         sides = 2 if round_turn else 1
         return float(self.lot * self.commission_per_lot_per_side_usd * sides)
 
-    def _pnl_from_prices(
-        self,
-        is_long: bool,
-        entry_ask: float,
-        entry_bid: float,
-        close_bid: float,
-        close_ask: float,
-    ) -> float:
-        """
-        Compute PnL in pips between entry and close prices:
-
-          long:  buy at ask,   close at bid  -> profit if close_bid > entry_ask
-          short: sell at bid,  close at ask  -> profit if close_ask < entry_bid
-        """
+    def _pnl_from_prices(self, is_long: bool, entry_ask: float, entry_bid: float, close_bid: float, close_ask: float) -> float:
         if is_long:
-            # long: profit = close - entry
             return (close_bid - entry_ask) / self.pip_decimal
         else:
-            # short: profit = entry - close
             return (entry_bid - close_ask) / self.pip_decimal
 
-
     def _compute_swap_usd(self, is_long: bool, entry_idx: int, exit_idx: int) -> float:
-        """
-        Approximate swap based on bar_times and tick_to_bar.
-        swap_*_pips_per_day are per 1 lot; scaled by lot size via _pip_value_usd().
-        """
         if not self.enable_swaps or exit_idx <= entry_idx:
             return 0.0
         if not hasattr(self, "bar_times") or self.bar_times is None:
@@ -880,7 +727,6 @@ class TradingEnv(gym.Env):
             if np.issubdtype(self.bar_times.dtype, np.datetime64):
                 days_held = float((t1 - t0) / np.timedelta64(1, "D"))
             else:
-                # assume seconds
                 days_held = float(t1 - t0) / (24.0 * 60.0 * 60.0)
         except Exception:
             days_held = float(exit_bar - entry_bar)
@@ -896,10 +742,6 @@ class TradingEnv(gym.Env):
         return float(rate * self._pip_value_usd() * days_held)
 
     def _equity_mtm(self) -> float:
-        """
-        Mark-to-market equity including floating PnL of the open position.
-        Commissions and swaps are only applied on open/close, not MTM.
-        """
         eq = float(self.balance)
 
         if self.position_side == 0 or self.position_entry_idx is None:
@@ -927,23 +769,25 @@ class TradingEnv(gym.Env):
             return float(x)
         return float((x - mean) / (std + 1e-8))
 
+    def _get_obs(self):
+        try:
+            self._update_price_normalizers(self.t)
+        except Exception:
+            pass
+        return self._get_observation(self.t)
+
     def _get_observation(self, tick_idx: int):
-        """
-        Observation vector:
-            [window_len * normalized_bar_features] + [ask_norm, bid_norm, spread_norm]
-        """
         bar_idx = int(self.tick_to_bar[tick_idx])
         L = self.window_len
         start = bar_idx - L + 1
 
         if start < 0:
             pad = np.zeros((-start, self.n_feats), dtype=np.float32)
-            win = np.asarray(self.bar_features[0 : bar_idx + 1], dtype=np.float32)
+            win = np.asarray(self.bar_features[0: bar_idx + 1], dtype=np.float32)
             feat_win = np.vstack([pad, win])
         else:
-            feat_win = np.asarray(self.bar_features[start : bar_idx + 1], dtype=np.float32)
+            feat_win = np.asarray(self.bar_features[start: bar_idx + 1], dtype=np.float32)
 
-        # Normalize bar features if scaler is available
         if self.normalize_bars and hasattr(self, "bars_mean") and self.bars_mean is not None:
             feat_win = (feat_win - self.bars_mean) / (self.bars_std + 1e-8)
 
@@ -951,21 +795,17 @@ class TradingEnv(gym.Env):
         bid = float(self.tick_bid[tick_idx])
         spread = ask - bid
 
-        # Normalized price features
         a = self._price_norm(ask, self.ask_mean, self.ask_std)
         b = self._price_norm(bid, self.bid_mean, self.bid_std)
         s = self._price_norm(spread, self.spread_mean, self.spread_std)
         price_feats = np.array([a, b, s], dtype=np.float32)
 
-        # --- NEW: position-state features ---
         if self.position_side == 0 or self.position_entry_idx is None:
-            # flat
-            pos_dir = 0.0          # 0 = flat
-            pos_pnl_R = 0.0        # unrealized PnL in R units
-            pos_age = 0.0          # normalized trade age
+            pos_dir = 0.0
+            pos_pnl_R = 0.0
+            pos_age = 0.0
         else:
             is_long = bool(self.position_is_long)
-            # mark-to-market PnL in pips using same logic as equity_mtm
             base_pips = self._pnl_from_prices(
                 is_long,
                 self.position_entry_ask,
@@ -975,58 +815,44 @@ class TradingEnv(gym.Env):
             )
             pip_value = self._pip_value_usd()
             float_profit_usd = float(base_pips * pip_value)
-
             one_R_usd = max(1e-8, self._pip_value_usd() * self.sl_pips)
             pos_pnl_R = float(float_profit_usd / one_R_usd)
-
             pos_dir = 1.0 if is_long else -1.0
-            # age scaled so typical trade lives in [0, 1] range
-            pos_age = float(self.position_duration_ticks) / 1000.0
+
+            # bars-based age
+            entry_bar = int(self.tick_to_bar[self.position_entry_idx])
+            pos_age_bars = max(0, bar_idx - entry_bar)
+            pos_age = float(pos_age_bars) / 1000.0
 
         pos_feats = np.array([pos_dir, pos_pnl_R, pos_age], dtype=np.float32)
 
-        # Final observation = [bars window] + [price_feats] + [pos_feats]
-        obs = np.hstack(
-            [feat_win.ravel(), price_feats, pos_feats]
-        ).astype(np.float32)
-
+        obs = np.hstack([feat_win.ravel(), price_feats, pos_feats]).astype(np.float32)
         return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _calculate_reward(self, profit_usd: float, new_dd_increment: float) -> float:
-        """
-        Reward function for a single trade close (or forced MTM close).
+    # -------------------------------------------------------------------------
+    # Date-based split helpers
+    # -------------------------------------------------------------------------
+    def _date_to_bar_index(self, date_str: str) -> int:
+        if date_str is None:
+            return 0
 
-        - Convert net profit in USD to R units, where 1R = SL distance in pips.
-            This makes the reward scale invariant to lot size and symbol.
+        target_dt = np.datetime64(date_str, "D")
+        bt = self.bar_times
 
-        - Slightly penalize losses more than equivalent gains:
-                +1R  -> +1.0 reward
-                -1R  -> -1.2 reward   (encourages avoiding bad trades)
-
-        - Optionally penalize *increases* in max drawdown:
-                reward -= dd_penalty_lambda * new_dd_increment
-
-            where new_dd_increment is in [0, 1] (fractional equity drawdown).
-        """
-        # If no movement, zero reward
-        if profit_usd == 0.0:
-            base_reward = 0.0
+        if np.issubdtype(bt.dtype, np.datetime64):
+            bt_d = bt.astype("datetime64[D]")
+            idx = int(np.searchsorted(bt_d, target_dt, side="left"))
+            return int(np.clip(idx, 0, self.n_bars))
         else:
-            # 1R in USD: SL (in pips) * pip_value_per_lot * lot_size
-            one_R_usd = max(1e-8, self._pip_value_usd() * self.sl_pips)
-            profit_R = float(profit_usd / one_R_usd)
+            epoch = np.datetime64("1970-01-01", "D")
+            days = (target_dt - epoch).astype(np.int64)
+            target_sec = float(days) * 86400.0
+            idx = int(np.searchsorted(bt.astype(np.float64), target_sec, side="left"))
+            return int(np.clip(idx, 0, self.n_bars))
 
-            # Asymmetric shaping: make losses hurt slightly more
-            if profit_R > 0.0:
-                base_reward = profit_R
-            else:
-                base_reward = 1.2 * profit_R  # amplify loss a bit
-
-        # Drawdown penalty (only when DD increases)
-        dd_penalty = self.dd_penalty_lambda * float(new_dd_increment)
-
-        reward = base_reward - dd_penalty
-        return float(reward)
+    def _bar_to_tick_index(self, bar_idx: int) -> int:
+        bar_idx = int(np.clip(bar_idx, 0, self.n_bars))
+        return int(np.searchsorted(self.tick_to_bar, bar_idx, side="left"))
 
     # -------------------------------------------------------------------------
     # Data loading
@@ -1051,6 +877,28 @@ class TradingEnv(gym.Env):
         assert self.tick_bid.shape == self.tick_ask.shape
         assert self.tick_to_bar.shape[0] == self.n_ticks
 
+        # ---------------- Date-based split (preferred) ----------------
+        self.split_bar = None
+        self.split_tick = None
+        self.eval_end_bar = None
+        self.eval_end_tick = None
+        self.train_start_bar = 0
+
+        if self.train_start_date:
+            self.train_start_bar = self._date_to_bar_index(self.train_start_date)
+
+        if self.eval_start_date:
+            self.split_bar = self._date_to_bar_index(self.eval_start_date)
+            self.split_tick = self._bar_to_tick_index(self.split_bar)
+
+            if self.eval_end_date:
+                self.eval_end_bar = self._date_to_bar_index(self.eval_end_date)
+                self.eval_end_tick = self._bar_to_tick_index(self.eval_end_bar)
+        else:
+            # fallback to fraction-based split
+            self.split_bar = int(self.n_bars * float(self.train_fraction))
+            self.split_tick = int(self.n_ticks * float(self.train_fraction))
+
         # Precompute bar feature scaler for train split if requested
         self.bars_mean = None
         self.bars_std = None
@@ -1062,9 +910,11 @@ class TradingEnv(gym.Env):
                 self.bars_mean = np.load(mean_path).astype(np.float32)
                 self.bars_std = np.load(std_path).astype(np.float32)
             else:
-                split_idx = int(self.n_bars * float(self.train_fraction))
-                if split_idx <= 0 or split_idx > self.n_bars:
-                    split_idx = self.n_bars
-                train_feats = np.asarray(self.bar_features[:split_idx], dtype=np.float32)
+                train_lo = int(getattr(self, "train_start_bar", 0))
+                train_hi = int(getattr(self, "split_bar", int(self.n_bars * float(self.train_fraction))))
+                train_lo = max(0, min(train_lo, self.n_bars))
+                train_hi = max(train_lo + 1, min(train_hi, self.n_bars))
+
+                train_feats = np.asarray(self.bar_features[train_lo:train_hi], dtype=np.float32)
                 self.bars_mean = train_feats.mean(axis=0)
                 self.bars_std = train_feats.std(axis=0) + 1e-8
