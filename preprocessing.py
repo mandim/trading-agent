@@ -50,6 +50,13 @@ def atr(high, low, close, window=14):
     alpha = 1.0 / window
     return ema(tr, alpha)
 
+
+def _date_to_epoch_seconds(date_str: str) -> int:
+    # Interpret as date boundary at 00:00:00 local time in the same convention as your CSV parsing.
+    # If you want UTC boundaries, set utc=True in pd.to_datetime in BOTH places consistently.
+    return int(pd.to_datetime(date_str, format="%Y-%m-%d", utc=False).timestamp())
+
+
 def preprocess(
     bars_csv,
     ticks_csv,
@@ -59,6 +66,8 @@ def preprocess(
     rsi_w=14,
     atr_w=14,
     train_fraction=0.7,
+    train_start_date: str | None = None,  # e.g. "2019-01-01"
+    eval_start_date: str | None = None,   # e.g. "2022-01-01" (start of validation)
 ):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -124,13 +133,26 @@ def preprocess(
         price_range, ret_std_20, ret_std_50,
     ]).astype(np.float32)
 
-    # --- Compute and save scaler for bar features (based on train split) ---
+    # --- Compute and save scaler for bar features (FIT ON TRAIN ONLY) ---
     n_bars = bars_features.shape[0]
-    split_idx = int(n_bars * float(train_fraction))
-    if split_idx <= 0:
-        raise ValueError("train_fraction results in empty training set for scaler.")
 
-    train_feats = bars_features[:split_idx]
+    if (train_start_date is not None) and (eval_start_date is not None):
+        t0 = _date_to_epoch_seconds(train_start_date)
+        t1 = _date_to_epoch_seconds(eval_start_date)
+
+        train_mask = (bt >= t0) & (bt < t1)
+        if not np.any(train_mask):
+            raise ValueError(
+                f"No bars in train window [{train_start_date}, {eval_start_date}). "
+                f"Check dates vs bars_csv range."
+            )
+        train_feats = bars_features[train_mask]
+    else:
+        split_idx = int(n_bars * float(train_fraction))
+        if split_idx <= 0:
+            raise ValueError("train_fraction results in empty training set for scaler.")
+        train_feats = bars_features[:split_idx]
+
     bars_mean = train_feats.mean(axis=0)
     bars_std = train_feats.std(axis=0) + 1e-8
 
@@ -195,10 +217,20 @@ def preprocess(
         "rsi_w": rsi_w,
         "atr_w": atr_w,
         "train_fraction": float(train_fraction),
+        "train_start_date": train_start_date,
+        "eval_start_date": eval_start_date,
     }
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, sort_keys=True)
 
+
 if __name__ == "__main__":
-    # Example:
-    preprocess("data/EURUSD_Daily.csv", "data/EURUSD_Ticks.csv", "cache_fx_EURUSD_D1")
+    # Example: train=2019-2021, validation starts 2022
+    preprocess(
+        "data/EURUSD_Daily.csv",
+        "data/EURUSD_Ticks.csv",
+        "cache_fx_EURUSD_D1",
+        train_fraction=0.7,               # fallback only if dates not set
+        train_start_date="2019-01-01",
+        eval_start_date="2022-01-01",     # scaler fit uses bars in [2019, 2022)
+    )

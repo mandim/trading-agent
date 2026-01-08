@@ -94,7 +94,11 @@ def main():
 
     # Pips / R if available
     avg_pips = float(df["pnl_pips"].mean()) if "pnl_pips" in df.columns else None
-    avg_R = float(df["profit_R_net"].mean()) if "profit_R_net" in df.columns else None
+    avg_R = None
+    if "profit_net_R" in df.columns:
+        avg_R = float(df["profit_net_R"].mean())
+    elif "profit_R_net" in df.columns:
+        avg_R = float(df["profit_R_net"].mean())
 
     # Costs
     commission_total = float(df["commission_usd"].sum()) if "commission_usd" in df.columns else 0.0

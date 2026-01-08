@@ -627,6 +627,7 @@ class TradingEnv(gym.Env):
         info = {
             "t": int(self.t),
             "bar_index": int(self.tick_to_bar[self.t]),
+            "bar_time": self.bar_times[int(self.tick_to_bar[self.t])],
             "equity": float(self.equity),
             "balance": float(self.balance),
             "position_side": int(self.position_side),

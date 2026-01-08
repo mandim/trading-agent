@@ -1,0 +1,16 @@
+{
+  "steps": 65,
+  "ep_return": 6.530007839202879,
+  "trades": 15,
+  "win_rate": 0.7333333333333333,
+  "avg_pnl_pips": 25.413354237874348,
+  "profit_factor_gross": 3.2253197678464556,
+  "profit_factor_net": 3.18706822149773,
+  "net_profit_usd": 3776.0031356811523,
+  "gross_profit_usd": 5525.016784667969,
+  "gross_loss_usd": 1713.0136489868164,
+  "commission_total_usd": 0.0,
+  "swap_total_usd": 36.0,
+  "other_costs_total_usd": 0.0,
+  "max_drawdown": 0.008592291454099054
+}

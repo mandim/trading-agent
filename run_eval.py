@@ -43,7 +43,7 @@ def make_env(
     cache_dir: str = "cache_fx_EURUSD_D1",
     train_start_date: str | None = "2019-01-01",
     eval_start_date: str | None = "2023-01-01",
-    eval_end_date: str | None = "2026-01-01",   # exclusive end for including all of 2025
+    eval_end_date: str | None = "2025-12-28",   # exclusive end for including all of 2025
 ):
     """
     Date-driven evaluation environment.
@@ -283,13 +283,13 @@ def run_episode(env: TradingEnv, net: nn.Module, device, tb_writer=None, ep_idx:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default="models/dqn_best.pt")
-    ap.add_argument("--episodes", type=int, default=5)
+    ap.add_argument("--episodes", type=int, default=10)
     ap.add_argument("--seed", type=int, default=999)
     ap.add_argument("--cachedir", type=str, default="cache_fx_EURUSD_D1")
 
     ap.add_argument("--train_start_date", type=str, default="2019-01-01")
     ap.add_argument("--eval_start_date", type=str, default="2023-01-01")
-    ap.add_argument("--eval_end_date", type=str, default="2026-01-01")  # exclusive end
+    ap.add_argument("--eval_end_date", type=str, default="2025-12-28")  # exclusive end
 
     ap.add_argument(
         "--device",

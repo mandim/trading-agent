@@ -119,10 +119,10 @@ def make_env(seed=123, eval_mode=False, reset_balance_each_episode=True):
         train_fraction=0.7,   # fallback only; overridden by dates below
         eval_mode=eval_mode,
 
-        # NEW: date split (Option 2)
+        # Date split for TRAIN + VALIDATION (no peeking at TEST)
         train_start_date="2019-01-01",
-        eval_start_date="2022-01-01",
-        eval_end_date="2023-01-01",
+        eval_start_date="2022-01-01",   # validation starts
+        eval_end_date="2023-01-01",     # validation ends (exclusive boundary)
 
         # Obs / normalization
         window_len=32,
@@ -281,8 +281,8 @@ def train(
             "eval_every": eval_every,
             # Snapshot split for reproducibility
             "train_start_date": "2019-01-01",
-            "eval_start_date": "2023-01-01",
-            "eval_end_date": "2026-01-01",
+            "eval_start_date": "2022-01-01",
+            "eval_end_date": "2023-01-01",
         },
         {},
     )
