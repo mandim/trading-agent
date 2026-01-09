@@ -7,7 +7,11 @@ def read_csv_autosep(path: str) -> pd.DataFrame:
     Tries python engine with automatic sep detection first; falls back to ';' then ','.
     """
     try:
-        return pd.read_csv(path, sep=None, engine="python")
+        df = pd.read_csv(path, sep=None, engine="python")
+        # If delimiter detection failed, pandas returns a single column with separators inside.
+        if df.shape[1] == 1 and df.columns.size == 1 and ";" in str(df.columns[0]):
+            raise ValueError("autosep_failed_semicolon")
+        return df
     except Exception:
         try:
             return pd.read_csv(path, sep=";")
@@ -42,6 +46,20 @@ def parse_bar_time(series: pd.Series) -> pd.Series:
 def read_actions(path: str, label: str) -> pd.DataFrame:
     df = read_csv_autosep(path)
     df = normalize_columns(df)
+
+    # Handle EA files that were appended without header (mixed format)
+    if len(df.columns) == 1 and df.columns[0].count(";") >= 6:
+        df = read_csv_autosep(path)
+        df = df.rename(columns={df.columns[0]: "raw"})
+        parts = df["raw"].astype(str).str.split(";", expand=True)
+        if parts.shape[1] >= 7:
+            parts = parts.iloc[:, :7]
+            parts.columns = ["bar_time", "action", "position_side", "ticket", "lots", "bid", "ask"]
+            df = parts
+
+    # If first column is numeric-like, assume bar_index is present without header.
+    if len(df.columns) >= 7 and df.columns[0] == "0":
+        df.columns = ["bar_index", "bar_time", "action", "position_side", "ticket", "lots", "bid", "ask"]
 
     # Candidate time columns
     time_col = find_column(df, ["bar_time", "bartime", "time", "datetime", "date"])
@@ -159,7 +177,24 @@ def main():
         print("[Test actions] bar_index:", td["bar_index"].min(), "->", td["bar_index"].max(), "rows=", len(td))
 
     merge_key = "bar_index" if ("bar_index" in ea.columns and "bar_index" in td.columns) else "bar_time"
-    m = ea.merge(td, on=merge_key, suffixes=("_ea", "_td"))
+    if merge_key == "bar_index":
+        # Try small offsets to handle 1-bar shifts between EA and test logs.
+        best = None
+        best_shift = 0
+        for shift in (-1, 0, 1):
+            tmp = td.copy()
+            tmp["bar_index"] = tmp["bar_index"] + shift
+            merged = ea.merge(tmp, on="bar_index", suffixes=("_ea", "_td"))
+            if best is None or len(merged) > best:
+                best = len(merged)
+                best_shift = shift
+        if best_shift != 0:
+            print(f"[align] Applying bar_index shift to TestDQN: {best_shift}")
+            td = td.copy()
+            td["bar_index"] = td["bar_index"] + best_shift
+        m = ea.merge(td, on="bar_index", suffixes=("_ea", "_td"))
+    else:
+        m = ea.merge(td, on=merge_key, suffixes=("_ea", "_td"))
     if len(m) == 0:
         # Diagnostics
         if "bar_time" in ea.columns:
@@ -181,6 +216,20 @@ def main():
     conf = pd.crosstab(m["action_ea"], m["action_td"], rownames=["EA"], colnames=["TestDQN"])
     print("\nConfusion matrix (counts):")
     print(conf)
+
+    # Mismatch report
+    mismatches = m[~m["match"]].copy()
+    if len(mismatches) > 0:
+        cols = []
+        if "bar_index" in mismatches.columns:
+            cols.append("bar_index")
+        if "bar_time" in mismatches.columns:
+            cols.append("bar_time")
+        cols += ["action_ea", "action_td"]
+        report = mismatches[cols].sort_values(cols[0] if cols else mismatches.index.name)
+        out_path = "action_mismatch_report.csv"
+        report.to_csv(out_path, index=False)
+        print(f"\nMismatch report saved -> {out_path} (rows={len(report)})")
 
     # Monthly PnL
     try:

@@ -311,7 +311,7 @@ def main():
 
     # STRICT TEST WINDOW
     ap.add_argument("--start", type=str, default="2025-01-01")
-    ap.add_argument("--end", type=str, default="2025-03-30")  # exclusive end => includes all of 2025
+    ap.add_argument("--end", type=str, default="2025-12-28")  # exclusive end => includes all of 2025
 
     ap.add_argument("--steps_csv", type=str, default="test_steps.csv")
     ap.add_argument("--trades_csv", type=str, default="test_trades_2025.csv")
@@ -338,7 +338,7 @@ def main():
     ap.add_argument("--slippage_pips_open", type=float, default=0.0)
     ap.add_argument("--slippage_pips_close", type=float, default=0.0)
     ap.add_argument("--slippage_mode", type=str, default="fixed")
-    ap.add_argument("--enable_slippage", action="store_true")
+    ap.add_argument("--enable_slippage", action="store_true", default=False)
     ap.add_argument("--slippage_pips", type=float, default=0.0)
     ap.add_argument("--other_fixed_cost_per_trade_usd", type=float, default=0.0)
 
