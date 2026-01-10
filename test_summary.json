@@ -1,16 +1,16 @@
 {
   "steps": 261,
-  "ep_return": 51.98009576797482,
-  "trades": 58,
-  "win_rate": 0.9310344827586207,
-  "avg_pnl_pips": 43.84834190894817,
-  "profit_factor_gross": 15.846372252919316,
-  "profit_factor_net": 15.731379808155891,
-  "net_profit_usd": 25433.928307189934,
-  "gross_profit_usd": 27145.051956176758,
-  "gross_loss_usd": 1713.0136489868164,
+  "ep_return": 36.86000959396257,
+  "trades": 59,
+  "win_rate": 0.8135593220338984,
+  "avg_pnl_pips": 32.989837012856036,
+  "profit_factor_gross": 5.21574260760325,
+  "profit_factor_net": 5.226374684578832,
+  "net_profit_usd": 19472.053837585023,
+  "gross_profit_usd": 24080.98491287197,
+  "gross_loss_usd": 4616.981075286942,
   "commission_total_usd": 0.0,
-  "swap_total_usd": -1.8899999999999952,
+  "swap_total_usd": -8.049999999999999,
   "other_costs_total_usd": 0.0,
-  "max_drawdown": 0.008592291454099054
+  "max_drawdown": 0.012232763672739377
 }

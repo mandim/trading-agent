@@ -371,7 +371,7 @@ def build_obs(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache_dir", default="cache_fx_EURUSD_D1")
+    parser.add_argument("--cache_dir", default="cache_fx_EURUSD_D1_fx")
     parser.add_argument("--model_path", default="models/dqn_best.pt")
     parser.add_argument("--bind", default="tcp://127.0.0.1:6000")
     parser.add_argument("--window_len", type=int, default=32)
@@ -403,6 +403,7 @@ def main():
     n_feats = None
     step_count = 0
     action_hist = {0: 0, 1: 0, 2: 0}
+    norm_diag = {"price_stats_ok": 0, "price_stats_missing": 0}
 
     # Feature-history minimum to compute std_50 properly
     min_raw_len = max(args.window_len, 60)
@@ -508,6 +509,10 @@ def main():
                         bar_index = idx
 
         price_stats = get_price_stats(price_cache, bar_index) if price_cache is not None else None
+        if price_stats is None:
+            norm_diag["price_stats_missing"] += 1
+        else:
+            norm_diag["price_stats_ok"] += 1
 
         sl_pips = req.get("sl_pips", None)
         if sl_pips is None:
@@ -539,6 +544,14 @@ def main():
             "bars=", float(np.mean(obs[:args.window_len*n_feats])),
             "price=", obs[args.window_len*n_feats:args.window_len*n_feats+3].tolist(),
             "pos=", obs[-3:].tolist())
+            total = max(1, norm_diag["price_stats_ok"] + norm_diag["price_stats_missing"])
+            miss_pct = 100.0 * norm_diag["price_stats_missing"] / total
+            print(
+                "[serve] norm diag:",
+                "price_stats_ok=", norm_diag["price_stats_ok"],
+                "price_stats_missing=", norm_diag["price_stats_missing"],
+                f"missing_pct={miss_pct:.2f}%"
+            )
 
         out = {
             "ok": True,
