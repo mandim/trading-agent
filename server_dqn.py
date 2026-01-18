@@ -1,4 +1,4 @@
-import os, json, argparse
+import os, json, argparse, csv
 from datetime import datetime
 import numpy as np
 import torch
@@ -371,7 +371,7 @@ def build_obs(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cache_dir", default="cache_fx_EURUSD_D1_fx")
+    parser.add_argument("--cache_dir", default="cache_fx_EURUSD_D1")
     parser.add_argument("--model_path", default="models/dqn_best.pt")
     parser.add_argument("--bind", default="tcp://127.0.0.1:6000")
     parser.add_argument("--window_len", type=int, default=32)
@@ -379,6 +379,7 @@ def main():
     parser.add_argument("--price_norm_lookback", type=int, default=20000)
     parser.add_argument("--log_every", type=int, default=50, help="print debug once every N steps (avoid slowing tester)")
     parser.add_argument("--default_sl_pips", type=float, default=40.0, help="must match training sl_pips if EA doesn't send")
+    parser.add_argument("--parity_log", type=str, default="ea_parity_log.csv", help="CSV path to log parity inputs per decision")
     args = parser.parse_args()
 
     bars_mean, bars_std = load_bars_scaler(args.cache_dir, bool(args.normalize_bars))
@@ -403,6 +404,29 @@ def main():
     n_feats = None
     step_count = 0
     action_hist = {0: 0, 1: 0, 2: 0}
+    parity_fh = None
+    parity_writer = None
+    feat_cols = [f"feat_{i}" for i in range(15)]
+    if args.parity_log:
+        parity_fh = open(args.parity_log, "w", newline="")
+        parity_writer = csv.DictWriter(
+            parity_fh,
+            fieldnames=[
+                "bar_index",
+                "bar_time",
+                "action",
+                "ask",
+                "bid",
+                "position_side",
+                "entry_ask",
+                "entry_bid",
+                "pos_age_bars",
+                "sl_pips",
+                "lot",
+                "exchange_rate",
+            ] + feat_cols,
+        )
+        parity_writer.writeheader()
     norm_diag = {"price_stats_ok": 0, "price_stats_missing": 0}
 
     # Feature-history minimum to compute std_50 properly
@@ -449,6 +473,7 @@ def main():
         bar_window_raw = req.get("bar_window_raw")
         bar_window = req.get("bar_window")  # legacy
 
+        last_feat = None
         if bar_window_raw is not None:
             bars_raw = np.asarray(bar_window_raw, dtype=np.float32)
 
@@ -459,12 +484,15 @@ def main():
             try:
                 bar_feats_full = compute_bar_features_from_raw(bars_raw)
                 bar_window = bar_feats_full[-args.window_len:, :]
+                last_feat = bar_feats_full[-1].astype(np.float32)
             except Exception as e:
                 sock.send_json({"ok": False, "error": f"feature_computation_failed: {str(e)}"})
                 continue
 
         elif bar_window is not None:
             bar_window = np.asarray(bar_window, dtype=np.float32)
+            if bar_window.ndim == 2 and bar_window.shape[0] > 0:
+                last_feat = bar_window[-1].astype(np.float32)
         else:
             sock.send_json({"ok": False, "error": "missing_bar_window_or_raw"})
             continue
@@ -498,8 +526,8 @@ def main():
                 pass
 
         bar_index = req.get("bar_index", None)
+        bar_time = req.get("bar_time", None)
         if bar_index is None:
-            bar_time = req.get("bar_time", None)
             if bar_time is not None and price_cache is not None:
                 epoch = _parse_bar_time(bar_time)
                 if epoch is not None:
@@ -544,6 +572,27 @@ def main():
             "bars=", float(np.mean(obs[:args.window_len*n_feats])),
             "price=", obs[args.window_len*n_feats:args.window_len*n_feats+3].tolist(),
             "pos=", obs[-3:].tolist())
+        if parity_writer is not None:
+            feat_vals = {}
+            if last_feat is not None and last_feat.size == len(feat_cols):
+                feat_vals = {f"feat_{i}": float(last_feat[i]) for i in range(len(feat_cols))}
+            parity_writer.writerow(
+                {
+                    "bar_index": bar_index if bar_index is not None else "",
+                    "bar_time": bar_time if bar_time is not None else "",
+                    "action": int(a),
+                    "ask": float(ask),
+                    "bid": float(bid),
+                    "position_side": int(req.get("position_side", 0)),
+                    "entry_ask": req.get("entry_ask", None),
+                    "entry_bid": req.get("entry_bid", None),
+                    "pos_age_bars": float(req.get("pos_age_bars", 0.0)),
+                    "sl_pips": float(sl_pips),
+                    "lot": float(req.get("lot", 1.0)),
+                    "exchange_rate": float(req.get("exchange_rate", 1.0)),
+                    **feat_vals,
+                }
+            )
             total = max(1, norm_diag["price_stats_ok"] + norm_diag["price_stats_missing"])
             miss_pct = 100.0 * norm_diag["price_stats_missing"] / total
             print(
@@ -563,6 +612,8 @@ def main():
 
     sock.close(0)
     ctx.term()
+    if parity_fh is not None:
+        parity_fh.close()
     print("[serve] Closed socket and context. Bye.")
 
 

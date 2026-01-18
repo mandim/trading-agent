@@ -92,6 +92,7 @@ def make_test_env(
         window_len=32,
         normalize_prices=True,
         normalize_bars=True,
+        use_prev_bar_features=True,
 
         # Runtime
         start_server=False,
@@ -125,8 +126,9 @@ def format_bar_time(bt) -> str:
 
 # -------------------- Strict single-pass test --------------------
 def run_strict_test(policy, env, device, tb: SummaryWriter | None):
-    
+
     action_rows = []
+    parity_rows = []
 
     s, _ = env.reset(seed=getattr(env, "_seed", None) or 999)
     done = False
@@ -160,6 +162,45 @@ def run_strict_test(policy, env, device, tb: SummaryWriter | None):
         while not done:
             q = policy(torch.from_numpy(s).float().unsqueeze(0).to(device))
             a = int(q.argmax(dim=1).item())
+
+            # Parity log inputs at decision time (pre-step)
+            decision_tick = int(env.t)
+            decision_bar_index = int(env.tick_to_bar[decision_tick])
+            bar_time_decision = format_bar_time(env.bar_times[decision_bar_index])
+
+            ask = float(env.tick_ask[decision_tick])
+            bid = float(env.tick_bid[decision_tick])
+
+            position_side = int(env.position_side)
+            entry_ask = env.position_entry_ask if env.position_entry_ask is not None else None
+            entry_bid = env.position_entry_bid if env.position_entry_bid is not None else None
+            pos_age_bars = 0.0
+            if position_side != 0 and env.position_entry_idx is not None:
+                entry_bar = int(env.tick_to_bar[int(env.position_entry_idx)])
+                pos_age_bars = max(0, decision_bar_index - entry_bar)
+
+            feat_vals = {}
+            prev_bar_idx = max(0, decision_bar_index - 1)
+            if hasattr(env, "bar_features"):
+                feats = np.asarray(env.bar_features[prev_bar_idx], dtype=np.float32)
+                if feats.size == 15:
+                    feat_vals = {f"feat_{i}": float(feats[i]) for i in range(15)}
+
+            parity_rows.append({
+                "bar_index": decision_bar_index,
+                "bar_time": bar_time_decision,
+                "action": a,
+                "ask": ask,
+                "bid": bid,
+                "position_side": position_side,
+                "entry_ask": entry_ask,
+                "entry_bid": entry_bid,
+                "pos_age_bars": float(pos_age_bars),
+                "sl_pips": float(env.sl_pips),
+                "lot": float(env.lot),
+                "exchange_rate": float(env.exchange_rate),
+                **feat_vals,
+            })
 
             s, r, term, trunc, info = env.step(a)
             done = bool(term or trunc)
@@ -285,7 +326,7 @@ def run_strict_test(policy, env, device, tb: SummaryWriter | None):
 
         "max_drawdown": float(max_dd),
     }
-    return summary, trade_rows, step_rows, action_rows
+    return summary, trade_rows, step_rows, action_rows, parity_rows
 
 
 def _write_csv(path: str, rows: list[dict]):
@@ -310,15 +351,15 @@ def main():
     ap.add_argument("--seed", type=int, default=999)
 
     # STRICT TEST WINDOW
-    ap.add_argument("--start", type=str, default="2025-01-02")
-    ap.add_argument("--end", type=str, default="2025-12-27")  # exclusive end => includes all of 2025
+    ap.add_argument("--start", type=str, default="2025-01-01")
+    ap.add_argument("--end", type=str, default="2025-12-28")  # exclusive end => includes all of 2025
 
     ap.add_argument("--steps_csv", type=str, default="test_steps.csv")
     ap.add_argument("--trades_csv", type=str, default="test_trades_2025.csv")
     ap.add_argument("--json", type=str, default="test_summary.json")
 
     ap.add_argument("--tb_dir", type=str, default="runs/test")
-    ap.add_argument("--no_tb", action="store_true")
+    ap.add_argument("--no_tb", action="store_false")
 
     ap.add_argument("--reset_balance_each_episode", action="store_true",
                     help="For strict test, typically keep this OFF (carry equity).")
@@ -327,6 +368,7 @@ def main():
                     help="0 => no limit (run full window). Otherwise truncates after N steps.")
     
     ap.add_argument("--actions_csv", type=str, default="test_actions_2025.csv")
+    ap.add_argument("--parity_log", type=str, default="td_parity_log.csv", help="CSV path to log parity inputs per decision")
 
     # Cost model (mirror MT4 tester)
     ap.add_argument("--commission_per_lot_per_side_usd", type=float, default=0.0)
@@ -406,13 +448,17 @@ def main():
             {},
         )
 
-    summary, trade_rows, step_rows, action_rows = run_strict_test(policy, env, device, tb)
+    summary, trade_rows, step_rows, action_rows, parity_rows = run_strict_test(policy, env, device, tb)
 
     _write_csv(args.trades_csv, trade_rows)
     _write_csv(args.steps_csv, step_rows)
     
     _write_csv(args.actions_csv, action_rows)
     print(f"Saved actions CSV -> {args.actions_csv}")
+
+    if args.parity_log:
+        _write_csv(args.parity_log, parity_rows)
+        print(f"Saved parity CSV -> {args.parity_log}")
 
     json_dir = os.path.dirname(args.json)
     if json_dir:

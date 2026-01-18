@@ -546,7 +546,8 @@ bool BuildBarFeaturesWindow(const int L, double &out[][MAX_FEATURES])
   // We'll fill k=0 oldest, k=L-1 newest (shift 0)
   for (int k = 0; k < L; k++)
   {
-    int shift = (L - 1) - k; // shift 0 newest, so this makes k=0 oldest
+    // Use previous closed bar window (shift +1) to avoid current-bar lookahead.
+    int shift = (L - 1) - k + 1;
 
     double o = iOpen(Symbol(), Period(), shift);
     double h = iHigh(Symbol(), Period(), shift);

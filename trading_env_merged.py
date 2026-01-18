@@ -94,6 +94,7 @@ class TradingEnv(gym.Env):
         window_len: int = 32,
         normalize_prices: bool = True,
         normalize_bars: bool = True,
+        use_prev_bar_features: bool = False,
 
         # Runtime / integration
         start_server: bool = False,
@@ -157,6 +158,7 @@ class TradingEnv(gym.Env):
         self.window_len = int(window_len)
         self.normalize_prices = bool(normalize_prices)
         self.normalize_bars = bool(normalize_bars)
+        self.use_prev_bar_features = bool(use_prev_bar_features)
 
         # RNG
         self._rng = np.random.default_rng(seed if seed is not None else 0)
@@ -779,15 +781,18 @@ class TradingEnv(gym.Env):
 
     def _get_observation(self, tick_idx: int):
         bar_idx = int(self.tick_to_bar[tick_idx])
+        feat_bar_idx = bar_idx
+        if self.use_prev_bar_features:
+            feat_bar_idx = max(0, bar_idx - 1)
         L = self.window_len
-        start = bar_idx - L + 1
+        start = feat_bar_idx - L + 1
 
         if start < 0:
             pad = np.zeros((-start, self.n_feats), dtype=np.float32)
-            win = np.asarray(self.bar_features[0: bar_idx + 1], dtype=np.float32)
+            win = np.asarray(self.bar_features[0: feat_bar_idx + 1], dtype=np.float32)
             feat_win = np.vstack([pad, win])
         else:
-            feat_win = np.asarray(self.bar_features[start: bar_idx + 1], dtype=np.float32)
+            feat_win = np.asarray(self.bar_features[start: feat_bar_idx + 1], dtype=np.float32)
 
         if self.normalize_bars and hasattr(self, "bars_mean") and self.bars_mean is not None:
             feat_win = (feat_win - self.bars_mean) / (self.bars_std + 1e-8)

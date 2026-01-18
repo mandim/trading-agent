@@ -128,6 +128,7 @@ def make_env(seed=123, eval_mode=False, reset_balance_each_episode=True):
         window_len=32,
         normalize_prices=True,
         normalize_bars=True,
+        use_prev_bar_features=True,
 
         # Runtime
         start_server=False,
