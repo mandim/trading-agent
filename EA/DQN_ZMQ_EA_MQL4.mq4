@@ -8,7 +8,7 @@
 // ==================== User Inputs ====================
 extern string Endpoint = "tcp://127.0.0.1:6000"; // must match serve_dqn.py --bind
 extern int WindowLen = 32;                       // must match server
-extern int RawWindowLen = 60;                    // MUST be >= 60 (server needs history for std_50)
+extern int RawWindowLen = 300;                   // Higher history reduces indicator drift (server needs >= 60 for std_50)
 extern int StepMs = 500;                         // query interval (ms)
 extern bool UseTickAskBid = true;                // use MarketInfo(Symbol(),MODE_ASK/BID)
 extern int SlPips = 40;                          // SL in pips
@@ -69,6 +69,9 @@ datetime g_last_bar_time = 0;
 int g_fh_actions = INVALID_HANDLE;
 extern bool LogActions = true;
 extern string ActionsFile = "ea_actions_2025.csv";
+int g_fh_exec = INVALID_HANDLE;
+extern bool LogExec = true;
+extern string ExecFile = "ea_exec_log.csv";
 
 // ==================== ZeroMQ Imports ====================
 #define ZMQ_REQ 3
@@ -229,6 +232,39 @@ uint LastMs = 0;
 int gLastResetDay = -1;    // last day-of-month we sent a reset
 datetime gLastBarTime = 0; // last bar time we sent a decision for
 datetime gLastLoggedBarTime = 0; // last bar time we logged any action
+datetime gLastExecBarTime = 0; // last bar time we logged exec diagnostics
+
+// ---- Exec diagnostics (per action) ----
+int gLastActionRequested = -1;
+int gLastActionEffective = -1;
+int gLastPosBefore = 0;
+double gLastPosAgeBars = 0.0;
+int gLastMinHoldBars = 0;
+int gLastCooldownBefore = 0;
+bool gLastBlockedByCooldown = false;
+bool gLastBlockedByMinHold = false;
+bool gLastBlockedByReverse = false;
+
+int gLastOrderSendAttempted = 0;
+bool gLastOrderSendOk = false;
+int gLastOrderSendTicket = -1;
+int gLastOrderSendError = 0;
+
+int gLastOrderCloseAttempted = 0;
+bool gLastOrderCloseOk = false;
+int gLastOrderCloseError = 0;
+
+int gLastErrorAfter = 0;
+
+// ---- Close diagnostics (from order history) ----
+bool gLastCloseDetected = false;
+string gLastCloseReason = "";
+int gLastCloseTicket = -1;
+double gLastClosePrice = 0.0;
+datetime gLastCloseTime = 0;
+double gLastCloseProfit = 0.0;
+double gLastCloseSwap = 0.0;
+double gLastCloseCommission = 0.0;
 
 // ==================== Utilities ====================
 int DigitsPips()
@@ -285,6 +321,94 @@ void OpenActionCsv()
   }
 }
 
+void ResetExecDiag()
+{
+  gLastActionRequested = -1;
+  gLastActionEffective = -1;
+  gLastPosBefore = 0;
+  gLastPosAgeBars = 0.0;
+  gLastMinHoldBars = 0;
+  gLastCooldownBefore = 0;
+  gLastBlockedByCooldown = false;
+  gLastBlockedByMinHold = false;
+  gLastBlockedByReverse = false;
+
+  gLastOrderSendAttempted = 0;
+  gLastOrderSendOk = false;
+  gLastOrderSendTicket = -1;
+  gLastOrderSendError = 0;
+
+  gLastOrderCloseAttempted = 0;
+  gLastOrderCloseOk = false;
+  gLastOrderCloseError = 0;
+
+  gLastErrorAfter = 0;
+
+  gLastCloseDetected = false;
+  gLastCloseReason = "";
+  gLastCloseTicket = -1;
+  gLastClosePrice = 0.0;
+  gLastCloseTime = 0;
+  gLastCloseProfit = 0.0;
+  gLastCloseSwap = 0.0;
+  gLastCloseCommission = 0.0;
+}
+
+void OpenExecCsv()
+{
+  if (!LogExec)
+    return;
+
+  g_fh_exec = FileOpen(
+      ExecFile,
+      FILE_CSV | FILE_WRITE | FILE_READ | FILE_SHARE_READ,
+      ';');
+
+  if (g_fh_exec == INVALID_HANDLE)
+  {
+    Print("ERROR opening Exec CSV: ", GetLastError());
+    return;
+  }
+
+  if (FileSize(g_fh_exec) == 0)
+  {
+    FileWrite(
+        g_fh_exec,
+        "bar_index",
+        "bar_time",
+        "action_req",
+        "action_eff",
+        "pos_side_before",
+        "pos_side_after",
+        "pos_age_bars",
+        "min_hold_bars",
+        "cooldown_before",
+        "blocked_by_cooldown",
+        "blocked_by_min_hold",
+        "blocked_by_reverse",
+        "order_send_attempted",
+        "order_send_ok",
+        "order_send_ticket",
+        "order_send_error",
+        "order_close_attempted",
+        "order_close_ok",
+        "order_close_error",
+        "last_error",
+        "close_detected",
+        "close_reason",
+        "close_ticket",
+        "close_price",
+        "close_time",
+        "close_profit",
+        "close_swap",
+        "close_commission");
+  }
+  else
+  {
+    FileSeek(g_fh_exec, 0, SEEK_END);
+  }
+}
+
 void LogAction(
     int action,
     int pos_side,
@@ -308,6 +432,53 @@ void LogAction(
       DoubleToString(Ask, Digits));
 
   FileFlush(g_fh_actions);
+}
+
+void LogExecDiagnostics()
+{
+  if (!LogExec || g_fh_exec == INVALID_HANDLE)
+    return;
+
+  datetime bt = iTime(Symbol(), Period(), 0);
+  if (gLastExecBarTime == bt)
+    return;
+
+  int bar_index = CurrentBarIndex();
+  int pos_after = CurrentDirection();
+
+  FileWrite(
+      g_fh_exec,
+      bar_index,
+      TimeToString(bt, TIME_DATE | TIME_MINUTES),
+      gLastActionRequested,
+      gLastActionEffective,
+      gLastPosBefore,
+      pos_after,
+      DoubleToString(gLastPosAgeBars, 2),
+      gLastMinHoldBars,
+      gLastCooldownBefore,
+      (gLastBlockedByCooldown ? 1 : 0),
+      (gLastBlockedByMinHold ? 1 : 0),
+      (gLastBlockedByReverse ? 1 : 0),
+      gLastOrderSendAttempted,
+      (gLastOrderSendOk ? 1 : 0),
+      gLastOrderSendTicket,
+      gLastOrderSendError,
+      gLastOrderCloseAttempted,
+      (gLastOrderCloseOk ? 1 : 0),
+      gLastOrderCloseError,
+      gLastErrorAfter,
+      (gLastCloseDetected ? 1 : 0),
+      gLastCloseReason,
+      gLastCloseTicket,
+      DoubleToString(gLastClosePrice, Digits),
+      TimeToString(gLastCloseTime, TIME_DATE | TIME_MINUTES),
+      DoubleToString(gLastCloseProfit, 2),
+      DoubleToString(gLastCloseSwap, 2),
+      DoubleToString(gLastCloseCommission, 2));
+
+  FileFlush(g_fh_exec);
+  gLastExecBarTime = bt;
 }
 
 void OnOpenedPositionWithTicket(int ticket)
@@ -345,6 +516,50 @@ void OnClosedPosition()
   if (gPrevDir != 0) // only if we truly were in a position
   {
     gCooldownBars = GetCooldownBars();
+  }
+  // Capture last closed order info for diagnostics
+  gLastCloseDetected = true;
+  gLastCloseReason = "unknown";
+  gLastCloseTicket = -1;
+  gLastClosePrice = 0.0;
+  gLastCloseTime = 0;
+  gLastCloseProfit = 0.0;
+  gLastCloseSwap = 0.0;
+  gLastCloseCommission = 0.0;
+
+  int total = OrdersHistoryTotal();
+  for (int i = total - 1; i >= 0; i--)
+  {
+    if (!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY))
+      continue;
+    if (OrderSymbol() != Symbol() || OrderMagicNumber() != Magic)
+      continue;
+    int type = OrderType();
+    if (type != OP_BUY && type != OP_SELL)
+      continue;
+
+    datetime ct = OrderCloseTime();
+    if (ct <= 0)
+      continue;
+    if (ct >= gLastCloseTime)
+    {
+      gLastCloseTime = ct;
+      gLastCloseTicket = OrderTicket();
+      gLastClosePrice = OrderClosePrice();
+      gLastCloseProfit = OrderProfit();
+      gLastCloseSwap = OrderSwap();
+      gLastCloseCommission = OrderCommission();
+
+      double tp = OrderTakeProfit();
+      double sl = OrderStopLoss();
+      double tol = MarketInfo(Symbol(), MODE_POINT) * 2;
+      if (tp > 0 && MathAbs(gLastClosePrice - tp) <= tol)
+        gLastCloseReason = "tp";
+      else if (sl > 0 && MathAbs(gLastClosePrice - sl) <= tol)
+        gLastCloseReason = "sl";
+      else
+        gLastCloseReason = "manual";
+    }
   }
   gHasEntry = false;
   gEntryAsk = 0.0;
@@ -597,9 +812,19 @@ bool ExecuteAction(const int a)
   // should not output 2 while in position. We still implement REVERSE here.
 
   int dir = CurrentDirection(); // -1 short, 0 flat, 1 long
+  ResetLastError();
+  gLastActionRequested = a;
+  gLastActionEffective = a;
+  gLastPosBefore = dir;
+  gLastPosAgeBars = (dir == 0 ? 0.0 : CurrentAgeBars());
+  gLastMinHoldBars = GetMinHoldBars();
+  gLastCooldownBefore = gCooldownBars;
 
   if (a == 0) // WAIT/HOLD
+  {
+    gLastActionEffective = 0;
     return true;
+  }
 
   double ask = MarketInfo(Symbol(), MODE_ASK);
   double bid = MarketInfo(Symbol(), MODE_BID);
@@ -615,34 +840,50 @@ bool ExecuteAction(const int a)
       if (a == 1 || a == 2)
       {
         Print("[DQN] COOLDOWN: action=", a, " -> HOLD (cooldown_bars=", gCooldownBars, ")");
+        gLastBlockedByCooldown = true;
+        gLastActionEffective = 0;
         return true;
       }
     }
     if (a == 1)
     {
       double lot = (ParityMode ? ParityLot : CalculatePositionSize(RiskPercent, SlPips));
+      gLastOrderSendAttempted = 1;
+      ResetLastError();
       int ticket = OrderSend(Symbol(), OP_BUY, lot, ask, SlippagePoints,
                              ask - sl, ask + tp, "DQN BUY", Magic, 0, clrGreen);
+      gLastOrderSendError = GetLastError();
+      gLastErrorAfter = gLastOrderSendError;
       // entry capture is done after successful OrderSend
       if (ticket < 0)
       {
         Print("[DQN] BUY failed, error=", GetLastError());
+        gLastActionEffective = 0;
         return false;
       }
+      gLastOrderSendOk = true;
+      gLastOrderSendTicket = ticket;
       OnOpenedPositionWithTicket(ticket);
       return true;
     }
     if (a == 2)
     {
       double lot = (ParityMode ? ParityLot : CalculatePositionSize(RiskPercent, SlPips));
+      gLastOrderSendAttempted = 1;
+      ResetLastError();
       int ticket = OrderSend(Symbol(), OP_SELL, lot, bid, SlippagePoints,
                              bid + sl, bid - tp, "DQN SELL", Magic, 0, clrTomato);
+      gLastOrderSendError = GetLastError();
+      gLastErrorAfter = gLastOrderSendError;
       // entry capture is done after successful OrderSend
       if (ticket < 0)
       {
         Print("[DQN] SELL failed, error=", GetLastError());
+        gLastActionEffective = 0;
         return false;
       }
+      gLastOrderSendOk = true;
+      gLastOrderSendTicket = ticket;
       OnOpenedPositionWithTicket(ticket);
       return true;
     }
@@ -660,6 +901,8 @@ bool ExecuteAction(const int a)
     {
       Print("[DQN] GATED: action=", a, " -> HOLD (age_bars=", DoubleToString(age_bars, 2),
             " < GetMinHoldBars()=", GetMinHoldBars(), ")");
+      gLastBlockedByMinHold = true;
+      gLastActionEffective = 0;
       return true; // HOLD
     }
   }
@@ -667,7 +910,12 @@ bool ExecuteAction(const int a)
   if (a == 1)
   {
     // CLOSE (only allowed once min-hold satisfied)
-    return CloseCurrentPosition();
+    if (!CloseCurrentPosition())
+    {
+      gLastActionEffective = 0;
+      return false;
+    }
+    return true;
   }
 
   if (a == 2)
@@ -676,12 +924,17 @@ bool ExecuteAction(const int a)
     if (!GetAllowReverse())
     {
       Print("[DQN] Reverse disabled -> HOLD");
+      gLastBlockedByReverse = true;
+      gLastActionEffective = 0;
       return true;
     }
 
     // REVERSE: close, then open opposite
     if (!CloseCurrentPosition())
+    {
+      gLastActionEffective = 0;
       return false;
+    }
 
     // After close, open opposite of previous dir
     if (dir == 1)
@@ -790,6 +1043,13 @@ void SyncPositionTransitions()
   gPrevEntryTime = curEntry;
 }
 
+void RefreshPrevPositionState()
+{
+  gPrevDir = CurrentDirection();
+  gPrevTicket = CurrentTicket();
+  gPrevEntryTime = CurrentEntryTime();
+}
+
 //+------------------------------------------------------------------+
 //| Current position info for observation alignment (EA -> server)   |
 //+------------------------------------------------------------------+
@@ -854,6 +1114,10 @@ double PipDecimalValue()
 // Close any open position for this EA & symbol
 bool CloseCurrentPosition()
 {
+  gLastOrderCloseAttempted = 0;
+  gLastOrderCloseOk = false;
+  gLastOrderCloseError = 0;
+
   for (int i = OrdersTotal() - 1; i >= 0; i--)
   {
     if (OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
@@ -867,12 +1131,19 @@ bool CloseCurrentPosition()
                            ? MarketInfo(Symbol(), MODE_BID)
                            : MarketInfo(Symbol(), MODE_ASK);
 
+        gLastOrderCloseAttempted = 1;
+        ResetLastError();
         if (!OrderClose(ticket, lots, price, SlippagePoints, clrRed))
         {
+          gLastOrderCloseError = GetLastError();
+          gLastErrorAfter = gLastOrderCloseError;
           Print("[DQN] Failed to close position, ticket=", ticket,
                 " error=", GetLastError());
           return false;
         }
+        gLastOrderCloseError = GetLastError();
+        gLastErrorAfter = gLastOrderCloseError;
+        gLastOrderCloseOk = true;
         OnClosedPosition();
         return true; // we only expect one position
       }
@@ -935,6 +1206,8 @@ int OnInit()
   g_last_bar_time = 0;
   gLastLoggedBarTime = 0;
   OpenActionCsv();
+  OpenExecCsv();
+  gLastExecBarTime = 0;
 
   // Initialize transition tracker
   gPrevDir = CurrentDirection();
@@ -955,6 +1228,8 @@ void OnDeinit(const int reason)
 {
   if (g_fh_actions != INVALID_HANDLE)
     FileClose(g_fh_actions);
+  if (g_fh_exec != INVALID_HANDLE)
+    FileClose(g_fh_exec);
 
   // Tell server to shut down (if connected)
   if (Zmq.Send("{\"cmd\":\"shutdown\"}"))
@@ -999,6 +1274,7 @@ void OnTick()
   }
 
   // Sync transitions so cooldown also applies to TP/SL closes (env parity)
+  ResetExecDiag();
   SyncPositionTransitions();
 
   // NOTE: cooldown decrement happens AFTER action processing (to match TradingEnv ordering)
@@ -1087,6 +1363,9 @@ void OnTick()
     LogAction(a, pos_side, ticket, lots);
     gLastLoggedBarTime = bt;
   }
+
+  LogExecDiagnostics();
+  RefreshPrevPositionState();
 
   // Cooldown decrement after decision to match TradingEnv ordering
   if (gCooldownBars > 0)

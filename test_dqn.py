@@ -172,6 +172,9 @@ def run_strict_test(policy, env, device, tb: SummaryWriter | None):
             bid = float(env.tick_bid[decision_tick])
 
             position_side = int(env.position_side)
+            pos_side_before = int(env.position_side)
+            cooldown_before = int(getattr(env, "cooldown_remaining", 0))
+            min_hold_bars = int(getattr(env, "min_hold_bars", 0))
             entry_ask = env.position_entry_ask if env.position_entry_ask is not None else None
             entry_bid = env.position_entry_bid if env.position_entry_bid is not None else None
             pos_age_bars = 0.0
@@ -229,7 +232,17 @@ def run_strict_test(policy, env, device, tb: SummaryWriter | None):
                 "tick_index": int(info.get("t", -1)),
                 "bar_index": int(info.get("bar_index", -1)),
                 "action_id": int(a),
+                "action_requested": int(info.get("action_requested", a)),
+                "action_effective": int(info.get("action_effective", a)),
+                "position_side_before": int(pos_side_before),
                 "position_side": int(info.get("position_side", 0)),
+                "pos_age_bars": float(pos_age_bars),
+                "min_hold_bars": int(min_hold_bars),
+                "cooldown_before": int(cooldown_before),
+                "blocked_by_cooldown": int(bool(info.get("blocked_by_cooldown", False))),
+                "blocked_by_min_hold": int(bool(info.get("blocked_by_min_hold", False))),
+                "blocked_by_reverse": int(bool(info.get("blocked_by_reverse", False))),
+                "cooldown_remaining": int(info.get("cooldown_remaining", 0)),
                 "equity": float(info.get("equity", float("nan"))),
                 "balance": float(info.get("balance", float("nan"))),
                 "reward": float(r),

@@ -366,14 +366,20 @@ class TradingEnv(gym.Env):
         _ = float(self._equity_mtm())  # equity_prev not used in realized-only reward version
 
         # bookkeeping (per decision step)
+        action_requested = int(action)
+        action_effective = int(action)
         opened_trade = False
         closed_trade = False
         reversed_trade = False
         blocked_by_cooldown = False
+        blocked_by_min_hold = False
+        blocked_by_reverse = False
 
         # Cooldown: prevent re-entry for N bars after any close (tp/sl/manual/eoe)
+        cooldown_before = int(self.cooldown_remaining)
         if self.cooldown_remaining > 0 and self.position_side == 0 and action in (1, 2):
             blocked_by_cooldown = True
+            action_effective = 0
             action = 0  # force WAIT while flat
 
         # Decrement cooldown counter *after* potential blocking check (counts bars)
@@ -401,6 +407,12 @@ class TradingEnv(gym.Env):
             pos_age_bars = bar_of(self.t) - bar_of(self.position_entry_idx)
 
         can_manual_exit = (pos_age_bars >= int(self.min_hold_bars))
+        if self.position_side != 0 and action in (1, 2) and not can_manual_exit:
+            blocked_by_min_hold = True
+            action_effective = 0
+        if self.position_side != 0 and action == 2 and (not bool(self.allow_reverse)) and can_manual_exit:
+            blocked_by_reverse = True
+            action_effective = 0
 
         # ---- commission/slippage helpers ----
         self._last_commission_usd = 0.0
@@ -650,7 +662,12 @@ class TradingEnv(gym.Env):
             "other_cost_usd": float(getattr(self, "_last_other_cost_usd", 0.0)),
 
             # NEW: expose cooldown diagnostics (for TB + debugging)
+            "action_requested": int(action_requested),
+            "action_effective": int(action_effective),
             "blocked_by_cooldown": bool(blocked_by_cooldown),
+            "blocked_by_min_hold": bool(blocked_by_min_hold),
+            "blocked_by_reverse": bool(blocked_by_reverse),
+            "cooldown_before": int(cooldown_before),
             "cooldown_remaining": int(self.cooldown_remaining),
         }
         return obs, float(reward), bool(self.terminated), bool(self.truncated), info
