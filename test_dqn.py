@@ -364,8 +364,8 @@ def main():
     ap.add_argument("--seed", type=int, default=999)
 
     # STRICT TEST WINDOW
-    ap.add_argument("--start", type=str, default="2025-01-01")
-    ap.add_argument("--end", type=str, default="2025-12-28")  # exclusive end => includes all of 2025
+    ap.add_argument("--start", type=str, default="2024-01-01")
+    ap.add_argument("--end", type=str, default="2025-01-01")  # exclusive end => includes all of 2025
 
     ap.add_argument("--steps_csv", type=str, default="test_steps.csv")
     ap.add_argument("--trades_csv", type=str, default="test_trades_2025.csv")
