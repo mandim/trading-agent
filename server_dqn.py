@@ -369,18 +369,61 @@ def build_obs(
     return obs
 
 
+def load_config(config_path: str) -> argparse.Namespace:
+    defaults = {
+        "cache_dir": "cache_fx_EURUSD_D1",
+        "model_path": "models/dqn_best_daily.pt",
+        "bind": "tcp://127.0.0.1:6000",
+        "window_len": 32,
+        "normalize_bars": 1,
+        "price_norm_lookback": 20000,
+        "log_every": 50,
+        "default_sl_pips": 40.0,
+        "parity_log": "ea_parity_log.csv",
+    }
+
+    if not os.path.exists(config_path):
+        raise SystemExit(f"[serve] Missing config file: {config_path}")
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"[serve] Invalid JSON in {config_path}: {e}")
+
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"[serve] Config must be a JSON object, got {type(cfg).__name__}")
+
+    merged = defaults.copy()
+    merged.update(cfg)
+
+    try:
+        merged["window_len"] = int(merged["window_len"])
+        merged["normalize_bars"] = int(merged["normalize_bars"])
+        merged["price_norm_lookback"] = int(merged["price_norm_lookback"])
+        merged["log_every"] = int(merged["log_every"])
+        merged["default_sl_pips"] = float(merged["default_sl_pips"])
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"[serve] Bad config value: {e}")
+
+    if merged.get("cache_dir") is not None:
+        merged["cache_dir"] = str(merged["cache_dir"])
+    if merged.get("model_path") is not None:
+        merged["model_path"] = str(merged["model_path"])
+    if merged.get("bind") is not None:
+        merged["bind"] = str(merged["bind"])
+    if merged.get("parity_log") is not None:
+        merged["parity_log"] = str(merged["parity_log"])
+
+    return argparse.Namespace(**merged)
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cache_dir", default="cache_fx_EURUSD_D1")
-    parser.add_argument("--model_path", default="models/dqn_best_daily.pt")
-    parser.add_argument("--bind", default="tcp://127.0.0.1:6000")
-    parser.add_argument("--window_len", type=int, default=32)
-    parser.add_argument("--normalize_bars", type=int, default=1)
-    parser.add_argument("--price_norm_lookback", type=int, default=20000)
-    parser.add_argument("--log_every", type=int, default=50, help="print debug once every N steps (avoid slowing tester)")
-    parser.add_argument("--default_sl_pips", type=float, default=40.0, help="must match training sl_pips if EA doesn't send")
-    parser.add_argument("--parity_log", type=str, default="ea_parity_log.csv", help="CSV path to log parity inputs per decision")
-    args = parser.parse_args()
+    config_path = os.getenv("SERVER_DQN_CONFIG", "server_dqn_config.json")
+    args = load_config(config_path)
+    print(f"[serve] Using config: {config_path}")
 
     bars_mean, bars_std = load_bars_scaler(args.cache_dir, bool(args.normalize_bars))
     price_cache = load_price_norm_cache(args.cache_dir)

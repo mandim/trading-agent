@@ -3,11 +3,6 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-# try:
-#     from server import ZMQRepServer
-# except Exception:
-#     ZMQRepServer = None
-
 
 class TradingEnv(gym.Env):
     """
@@ -96,11 +91,9 @@ class TradingEnv(gym.Env):
         normalize_bars: bool = True,
         use_prev_bar_features: bool = False,
 
-        # Runtime / integration
-        start_server: bool = False,
-        bind_address: str = "tcp://*:5555",
         seed: int | None = None,
     ):
+        """Initialize configuration/state and load cached data so episodes can run."""
         super().__init__()
 
         # Inputs kept only for reference (candles_file/tick_file may be unused)
@@ -205,70 +198,16 @@ class TradingEnv(gym.Env):
         self.bid_mean = self.bid_std = None
         self.spread_mean = self.spread_std = None
 
-        # Optional ZMQ server placeholder (avoid attribute errors)
-        self.server = None
-        # if start_server and ZMQRepServer is not None:
-        #     self.server = ZMQRepServer(bind_address, self._handle_request)
-
-    # -------------------------------------------------------------------------
-    # Optional server
-    # -------------------------------------------------------------------------
-    def start_server(self):
-        if self.server is not None:
-            print("Starting Env Server...")
-            self.server.start()
-
-    def stop_server(self):
-        if self.server is not None:
-            print("Stopping Env Server...")
-            self.server.stop()
-
-    def _handle_request(self, request):
-        if not isinstance(request, dict):
-            return {"reply": "invalid_request"}
-
-        cmd = str(request.get("cmd", "")).upper().strip()
-
-        if cmd == "HOLD":
-            action = 0
-        elif cmd == "CLOSE":
-            action = 1 if self.position_side != 0 else 0
-        elif cmd == "BUY":
-            if self.position_side == 0:
-                action = 1
-            elif self.position_side < 0:
-                action = 2
-            else:
-                action = 0
-        elif cmd == "SELL":
-            if self.position_side == 0:
-                action = 2
-            elif self.position_side > 0:
-                action = 2
-            else:
-                action = 0
-        elif cmd == "REVERSE":
-            action = 2
-        else:
-            return {"reply": "unknown_command", "received": request}
-
-        obs, reward, terminated, truncated, info = self.step(action)
-        return {
-            "obs": obs.tolist(),
-            "reward": float(reward),
-            "terminated": bool(terminated),
-            "truncated": bool(truncated),
-            "info": info,
-        }
-
     # -------------------------------------------------------------------------
     # Gymnasium API
     # -------------------------------------------------------------------------
     def seed(self, seed: int | None = None):
+        """Seed the RNG to make sampling reproducible across runs."""
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
+        """Reset episode state and choose a valid starting tick for the next run."""
         super().reset(seed=seed)
         if seed is not None:
             self.seed(seed)
@@ -332,20 +271,24 @@ class TradingEnv(gym.Env):
         return obs, {}
 
     def step(self, action: int):
+        """Advance one decision step, simulate intrabar fills, and return the Gym tuple."""
         if self.terminated or self.truncated:
             return self._get_observation(self.t), 0.0, True, True, {}
 
         # ---- helpers ----
         def is_bar_open(idx: int) -> bool:
+            """Check if a tick index is a bar boundary for decision timing."""
             if idx <= 0:
                 return True
             return int(self.tick_to_bar[idx]) != int(self.tick_to_bar[idx - 1])
 
         def advance_to_bar_open():
+            """Advance tick pointer to the next bar open to enforce decision cadence."""
             while self.t < (self.n_ticks - 1) and not is_bar_open(self.t):
                 self.t += 1
 
         def bar_of(idx: int) -> int:
+            """Map a tick index to its bar index with bounds protection."""
             return int(self.tick_to_bar[min(max(idx, 0), self.n_ticks - 1)])
 
         # ---- 0) align to decision point ----
@@ -420,6 +363,7 @@ class TradingEnv(gym.Env):
         self._last_other_cost_usd = 0.0
 
         def apply_commission_side():
+            """Apply one-side commission cost to balance for trade cost modeling."""
             if bool(self.enable_commission):
                 c = float(self._commission_usd(round_turn=False))
                 self.balance -= c
@@ -427,6 +371,7 @@ class TradingEnv(gym.Env):
                 self._last_commission_usd += c
 
         def apply_slippage(price: float, is_entry: bool, is_long: bool) -> float:
+            """Adjust execution price for slippage to simulate broker fills."""
             if not bool(self.enable_slippage):
                 return price
 
@@ -443,6 +388,7 @@ class TradingEnv(gym.Env):
                 return price - slip if is_long else price + slip
 
         def close_position(reason: str):
+            """Close the current position, apply costs, and finalize trade stats."""
             nonlocal trade_pnl_pips, trade_pnl_usd, trade_profit_R, is_profitable, exit_reason
 
             bid = float(self.tick_bid[self.t])
@@ -676,6 +622,7 @@ class TradingEnv(gym.Env):
     # Normalization / sampling helpers
     # -------------------------------------------------------------------------
     def _update_price_normalizers(self, tick_idx: int):
+        """Update expanding mean/std for price features to stabilize observations."""
         if not self.normalize_prices:
             return
 
@@ -699,6 +646,7 @@ class TradingEnv(gym.Env):
         self.spread_std = float(window_spread.std() + 1e-8)
 
     def _sample_slippage(self, base_pips: float) -> float:
+        """Sample slippage in pips based on the configured distribution."""
         if base_pips <= 0:
             return 0.0
 
@@ -712,24 +660,29 @@ class TradingEnv(gym.Env):
         return base_pips
 
     def _pip_value_usd_per_lot(self) -> float:
+        """Compute USD value of one pip per lot for PnL conversion."""
         return (100000.0 * self.pip_decimal) / max(1e-12, self.exchange_rate)
 
     def _pip_value_usd(self) -> float:
+        """Compute USD value of one pip for the current lot size."""
         return self._pip_value_usd_per_lot() * self.lot
 
     def _commission_usd(self, round_turn: bool = False) -> float:
+        """Calculate commission in USD for a side or round turn."""
         if not self.enable_commission or self.commission_per_lot_per_side_usd <= 0.0:
             return 0.0
         sides = 2 if round_turn else 1
         return float(self.lot * self.commission_per_lot_per_side_usd * sides)
 
     def _pnl_from_prices(self, is_long: bool, entry_ask: float, entry_bid: float, close_bid: float, close_ask: float) -> float:
+        """Convert entry/exit prices to PnL in pips for reward/equity."""
         if is_long:
             return (close_bid - entry_ask) / self.pip_decimal
         else:
             return (entry_bid - close_ask) / self.pip_decimal
 
     def _compute_swap_usd(self, is_long: bool, entry_idx: int, exit_idx: int) -> float:
+        """Compute swap cost in USD based on holding duration."""
         if not self.enable_swaps or exit_idx <= entry_idx:
             return 0.0
         if not hasattr(self, "bar_times") or self.bar_times is None:
@@ -762,6 +715,7 @@ class TradingEnv(gym.Env):
         return float(rate * self._pip_value_usd() * days_held)
 
     def _equity_mtm(self) -> float:
+        """Mark-to-market equity for drawdown tracking and logging."""
         eq = float(self.balance)
 
         if self.position_side == 0 or self.position_entry_idx is None:
@@ -785,11 +739,13 @@ class TradingEnv(gym.Env):
         return float(eq + float_profit_usd)
 
     def _price_norm(self, x: float, mean: float, std: float) -> float:
+        """Normalize a price feature when normalization is enabled."""
         if (not self.normalize_prices) or mean is None or std is None or std == 0.0:
             return float(x)
         return float((x - mean) / (std + 1e-8))
 
     def _get_obs(self):
+        """Expose a safe observation getter that refreshes price normalizers."""
         try:
             self._update_price_normalizers(self.t)
         except Exception:
@@ -797,6 +753,7 @@ class TradingEnv(gym.Env):
         return self._get_observation(self.t)
 
     def _get_observation(self, tick_idx: int):
+        """Build the observation window plus price and position features."""
         bar_idx = int(self.tick_to_bar[tick_idx])
         feat_bar_idx = bar_idx
         if self.use_prev_bar_features:
@@ -856,6 +813,7 @@ class TradingEnv(gym.Env):
     # Date-based split helpers
     # -------------------------------------------------------------------------
     def _date_to_bar_index(self, date_str: str) -> int:
+        """Convert a date string to the corresponding bar index for splits."""
         if date_str is None:
             return 0
 
@@ -874,6 +832,7 @@ class TradingEnv(gym.Env):
             return int(np.clip(idx, 0, self.n_bars))
 
     def _bar_to_tick_index(self, bar_idx: int) -> int:
+        """Convert a bar index to the first tick index in that bar."""
         bar_idx = int(np.clip(bar_idx, 0, self.n_bars))
         return int(np.searchsorted(self.tick_to_bar, bar_idx, side="left"))
 
@@ -881,6 +840,7 @@ class TradingEnv(gym.Env):
     # Data loading
     # -------------------------------------------------------------------------
     def _load_cache(self, cache_dir: str):
+        """Load cached arrays and compute split/scaler metadata for the env."""
         needed = ["bars_features.npy", "bar_times.npy", "tick_ask.npy", "tick_bid.npy", "tick_to_bar.npy"]
         for f in needed:
             p = os.path.join(cache_dir, f)

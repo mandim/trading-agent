@@ -1,0 +1,18 @@
+{
+  "steps": 2000000,
+  "batch_size": 256,
+  "gamma": 0.995,
+  "lr": 5e-5,
+  "start_training": 20000,
+  "target_tau": 0.005,
+  "eps_start": 1.0,
+  "eps_end": 0.15,
+  "eps_decay_steps": 1200000,
+  "eval_every": 200000,
+  "logdir": "runs/dqn",
+  "log_every_steps": 5000,
+  "run_tag": "DQN_fx",
+  "clean_logs": false,
+  "debug": false,
+  "debug_steps": 200
+}

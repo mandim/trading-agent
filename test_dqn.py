@@ -95,7 +95,6 @@ def make_test_env(
         use_prev_bar_features=True,
 
         # Runtime
-        start_server=False,
         seed=seed,
     )
 
@@ -354,50 +353,105 @@ def _write_csv(path: str, rows: list[dict]):
         w.writerows(rows)
 
 
+def _coerce_bool(value, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "y", "on"):
+            return True
+        if v in ("0", "false", "no", "n", "off", ""):
+            return False
+    raise ValueError(f"{key} must be a boolean")
+
+
+def load_config(config_path: str) -> argparse.Namespace:
+    defaults = {
+        "model": "models/dqn_best.pt",
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "cache_dir": "cache_fx_EURUSD_D1_fx",
+        "seed": 999,
+        "start": "2024-01-01",
+        "end": "2025-01-01",
+        "steps_csv": "test_steps.csv",
+        "trades_csv": "test_trades_2025.csv",
+        "json": "test_summary.json",
+        "tb_dir": "runs/test",
+        "no_tb": True,
+        "reset_balance_each_episode": False,
+        "max_steps": 0,
+        "actions_csv": "test_actions_2025.csv",
+        "parity_log": "td_parity_log.csv",
+        "commission_per_lot_per_side_usd": 0.0,
+        "enable_commission": False,
+        "enable_swaps": True,
+        "swap_long_pips_per_day": -0.971,
+        "swap_short_pips_per_day": 0.45,
+        "slippage_pips_open": 0.0,
+        "slippage_pips_close": 0.0,
+        "slippage_mode": "fixed",
+        "enable_slippage": False,
+        "slippage_pips": 0.0,
+        "other_fixed_cost_per_trade_usd": 0.0,
+    }
+
+    if not os.path.exists(config_path):
+        raise SystemExit(f"[test] Missing config file: {config_path}")
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"[test] Invalid JSON in {config_path}: {e}")
+
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"[test] Config must be a JSON object, got {type(cfg).__name__}")
+
+    merged = defaults.copy()
+    merged.update(cfg)
+
+    try:
+        merged["seed"] = int(merged["seed"])
+        merged["max_steps"] = int(merged["max_steps"])
+        merged["commission_per_lot_per_side_usd"] = float(merged["commission_per_lot_per_side_usd"])
+        merged["swap_long_pips_per_day"] = float(merged["swap_long_pips_per_day"])
+        merged["swap_short_pips_per_day"] = float(merged["swap_short_pips_per_day"])
+        merged["slippage_pips_open"] = float(merged["slippage_pips_open"])
+        merged["slippage_pips_close"] = float(merged["slippage_pips_close"])
+        merged["slippage_pips"] = float(merged["slippage_pips"])
+        merged["other_fixed_cost_per_trade_usd"] = float(merged["other_fixed_cost_per_trade_usd"])
+        merged["no_tb"] = _coerce_bool(merged["no_tb"], "no_tb")
+        merged["reset_balance_each_episode"] = _coerce_bool(
+            merged["reset_balance_each_episode"], "reset_balance_each_episode"
+        )
+        merged["enable_commission"] = _coerce_bool(merged["enable_commission"], "enable_commission")
+        merged["enable_swaps"] = _coerce_bool(merged["enable_swaps"], "enable_swaps")
+        merged["enable_slippage"] = _coerce_bool(merged["enable_slippage"], "enable_slippage")
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"[test] Bad config value: {e}")
+
+    for key in (
+        "model", "device", "cache_dir", "start", "end", "steps_csv", "trades_csv", "json",
+        "tb_dir", "actions_csv", "parity_log", "slippage_mode",
+    ):
+        if merged.get(key) is not None:
+            merged[key] = str(merged[key])
+
+    device_val = merged.get("device")
+    if device_val is None or str(device_val).strip().lower() == "auto":
+        merged["device"] = "cuda" if torch.cuda.is_available() else "cpu"
+
+    return argparse.Namespace(**merged)
+
+
 def main():
-    ap = argparse.ArgumentParser()
-
-    ap.add_argument("--model", type=str, default="models/dqn_best.pt")
-    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-
-    ap.add_argument("--cache_dir", type=str, default="cache_fx_EURUSD_D1_fx")
-    ap.add_argument("--seed", type=int, default=999)
-
-    # STRICT TEST WINDOW
-    ap.add_argument("--start", type=str, default="2024-01-01")
-    ap.add_argument("--end", type=str, default="2025-01-01")  # exclusive end => includes all of 2025
-
-    ap.add_argument("--steps_csv", type=str, default="test_steps.csv")
-    ap.add_argument("--trades_csv", type=str, default="test_trades_2025.csv")
-    ap.add_argument("--json", type=str, default="test_summary.json")
-
-    ap.add_argument("--tb_dir", type=str, default="runs/test")
-    ap.add_argument("--no_tb", action="store_false")
-
-    ap.add_argument("--reset_balance_each_episode", action="store_true",
-                    help="For strict test, typically keep this OFF (carry equity).")
-
-    ap.add_argument("--max_steps", type=int, default=0,
-                    help="0 => no limit (run full window). Otherwise truncates after N steps.")
-    
-    ap.add_argument("--actions_csv", type=str, default="test_actions_2025.csv")
-    ap.add_argument("--parity_log", type=str, default="td_parity_log.csv", help="CSV path to log parity inputs per decision")
-
-    # Cost model (mirror MT4 tester)
-    ap.add_argument("--commission_per_lot_per_side_usd", type=float, default=0.0)
-    ap.add_argument("--enable_commission", action="store_true")
-    ap.add_argument("--enable_swaps", action="store_true", default=True)
-    # MT4 shows swap in points; EURUSD (5 digits) => 10 points = 1 pip.
-    ap.add_argument("--swap_long_pips_per_day", type=float, default=-0.971)
-    ap.add_argument("--swap_short_pips_per_day", type=float, default=0.45)
-    ap.add_argument("--slippage_pips_open", type=float, default=0.0)
-    ap.add_argument("--slippage_pips_close", type=float, default=0.0)
-    ap.add_argument("--slippage_mode", type=str, default="fixed")
-    ap.add_argument("--enable_slippage", action="store_true", default=False)
-    ap.add_argument("--slippage_pips", type=float, default=0.0)
-    ap.add_argument("--other_fixed_cost_per_trade_usd", type=float, default=0.0)
-
-    args = ap.parse_args()
+    config_path = os.getenv("TEST_DQN_CONFIG", "test_dqn_config.json")
+    args = load_config(config_path)
+    print(f"[test] Using config: {config_path}")
 
     device = torch.device(args.device)
 

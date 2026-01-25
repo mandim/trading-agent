@@ -106,7 +106,6 @@ def make_env(
         normalize_bars=True,
 
         # Runtime
-        start_server=False,
         seed=seed,
     )
     return env

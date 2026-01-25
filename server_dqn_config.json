@@ -1,0 +1,11 @@
+{
+  "cache_dir": "cache_fx_EURUSD_D1",
+  "model_path": "models/dqn_best_daily.pt",
+  "bind": "tcp://127.0.0.1:6000",
+  "window_len": 32,
+  "normalize_bars": 1,
+  "price_norm_lookback": 20000,
+  "log_every": 50,
+  "default_sl_pips": 40.0,
+  "parity_log": "ea_parity_log.csv"
+}

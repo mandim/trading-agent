@@ -1,4 +1,4 @@
-import os, random, collections, time, shutil
+import os, json, random, collections, time, shutil
 import numpy as np
 import torch
 import torch.nn as nn
@@ -131,8 +131,6 @@ def make_env(seed=123, eval_mode=False, reset_balance_each_episode=True):
         use_prev_bar_features=True,
 
         # Runtime
-        start_server=False,
-        bind_address="tcp://*:5555",
         seed=seed,
     )
     return env
@@ -158,6 +156,83 @@ def _make_tb_writer(base_dir: str, run_tag: str | None = None, clean: bool = Fal
     os.makedirs(run_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=run_dir)
     return writer, name
+
+
+def _coerce_bool(value, key: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "y", "on"):
+            return True
+        if v in ("0", "false", "no", "n", "off", ""):
+            return False
+    raise ValueError(f"{key} must be a boolean")
+
+
+def load_config(config_path: str):
+    defaults = {
+        "steps": 2_000_000,
+        "batch_size": 256,
+        "gamma": 0.995,
+        "lr": 5e-5,
+        "start_training": 20_000,
+        "target_tau": 0.005,
+        "eps_start": 1.0,
+        "eps_end": 0.15,
+        "eps_decay_steps": 1_200_000,
+        "eval_every": 200_000,
+        "logdir": "runs/dqn",
+        "log_every_steps": 5_000,
+        "run_tag": "DQN_fx",
+        "clean_logs": False,
+        "debug": False,
+        "debug_steps": 200,
+    }
+
+    if not os.path.exists(config_path):
+        raise SystemExit(f"[train] Missing config file: {config_path}")
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"[train] Invalid JSON in {config_path}: {e}")
+
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise SystemExit(f"[train] Config must be a JSON object, got {type(cfg).__name__}")
+
+    merged = defaults.copy()
+    merged.update(cfg)
+
+    try:
+        merged["steps"] = int(merged["steps"])
+        merged["batch_size"] = int(merged["batch_size"])
+        merged["gamma"] = float(merged["gamma"])
+        merged["lr"] = float(merged["lr"])
+        merged["start_training"] = int(merged["start_training"])
+        merged["target_tau"] = float(merged["target_tau"])
+        merged["eps_start"] = float(merged["eps_start"])
+        merged["eps_end"] = float(merged["eps_end"])
+        merged["eps_decay_steps"] = int(merged["eps_decay_steps"])
+        merged["eval_every"] = int(merged["eval_every"])
+        merged["log_every_steps"] = int(merged["log_every_steps"])
+        merged["debug_steps"] = int(merged["debug_steps"])
+        merged["clean_logs"] = _coerce_bool(merged["clean_logs"], "clean_logs")
+        merged["debug"] = _coerce_bool(merged["debug"], "debug")
+    except (TypeError, ValueError) as e:
+        raise SystemExit(f"[train] Bad config value: {e}")
+
+    if merged.get("logdir") is not None:
+        merged["logdir"] = str(merged["logdir"])
+    if merged.get("run_tag") is not None:
+        merged["run_tag"] = str(merged["run_tag"])
+
+    return merged
 
 
 # ----------------- Evaluation helper -----------------
@@ -534,44 +609,26 @@ def train(
 
 
 if __name__ == "__main__":
-    import argparse
-
-    p = argparse.ArgumentParser()
-    p.add_argument("--steps", type=int, default=2_000_000)
-    p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--gamma", type=float, default=0.995)
-    p.add_argument("--lr", type=float, default=5e-5)
-    p.add_argument("--start_training", type=int, default=20_000)
-    p.add_argument("--target_tau", type=float, default=0.005)
-    p.add_argument("--eps_start", type=float, default=1.0)
-    p.add_argument("--eps_end", type=float, default=0.15)
-    p.add_argument("--eps_decay_steps", type=int, default=1_200_000)
-    p.add_argument("--eval_every", type=int, default=200_000)
-    p.add_argument("--logdir", type=str, default="runs/dqn")
-    p.add_argument("--log_every_steps", type=int, default=5_000)
-    p.add_argument("--run_tag", type=str, default="DQN_fx")
-    p.add_argument("--clean_logs", action="store_true")
-    p.add_argument("--debug", action="store_true")
-    p.add_argument("--debug_steps", type=int, default=200)
-
-    args = p.parse_args()
+    config_path = os.getenv("TRAIN_DQN_CONFIG", "train_dqn_config.json")
+    args = load_config(config_path)
+    print(f"[train] Using config: {config_path}")
 
     train(
-        steps=args.steps,
-        batch_size=args.batch_size,
-        gamma=args.gamma,
-        lr=args.lr,
-        start_training=args.start_training,
-        target_tau=args.target_tau,
-        eps_start=args.eps_start,
-        eps_end=args.eps_end,
-        eps_decay_steps=args.eps_decay_steps,
-        eval_every=args.eval_every,
-        logdir=args.logdir,
-        log_every_steps=args.log_every_steps,
+        steps=args["steps"],
+        batch_size=args["batch_size"],
+        gamma=args["gamma"],
+        lr=args["lr"],
+        start_training=args["start_training"],
+        target_tau=args["target_tau"],
+        eps_start=args["eps_start"],
+        eps_end=args["eps_end"],
+        eps_decay_steps=args["eps_decay_steps"],
+        eval_every=args["eval_every"],
+        logdir=args["logdir"],
+        log_every_steps=args["log_every_steps"],
         print_episode_end=True,
-        run_tag=args.run_tag,
-        clean_logs=args.clean_logs,
-        debug=args.debug,
-        debug_steps=args.debug_steps,
+        run_tag=args["run_tag"],
+        clean_logs=args["clean_logs"],
+        debug=args["debug"],
+        debug_steps=args["debug_steps"],
     )
